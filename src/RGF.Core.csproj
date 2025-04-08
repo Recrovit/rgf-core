@@ -18,7 +18,7 @@
     <Year2>$([System.DateTime]::Now.ToString(yy))</Year2>
     <DateMd>$([System.DateTime]::Now.ToString(MMdd))</DateMd>
     <VersionRevision>1</VersionRevision>
-    <Version>8.16.0</Version>
+    <Version>8.17.0</Version>
     <FileVersion>$(Version).$(VersionRevision)$(DateMd)</FileVersion>
     <InformationalVersion>$(Version).$(Year2).$(DateMd).$(VersionRevision)</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
@@ -40,7 +40,7 @@
   </Target>
 
   <ItemGroup>
-    <PackageReference Include="RecroGrid" Version="8.16.0" Condition="'$(Configuration)'=='Release'" />
+    <PackageReference Include="RecroGrid" Version="8.17.0" Condition="'$(Configuration)'=='Release'" />
     <ProjectReference Include="..\..\RGF.Legacy\src\RGF.csproj" Condition="'$(Configuration)'=='Debug'" />
   </ItemGroup>
 
