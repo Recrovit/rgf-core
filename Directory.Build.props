@@ -24,7 +24,7 @@
 
   <!-- Versioning -->
   <PropertyGroup>
-    <Version>10.1.0</Version>
+    <Version>10.1.1</Version>
     <FileVersion>$(Version).1$([System.DateTime]::Now.ToString('MMdd'))</FileVersion>
     <InformationalVersion>$(FileVersion)</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
