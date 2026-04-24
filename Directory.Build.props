@@ -1,0 +1,47 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!-- Configuration -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <!-- Custom Properties -->
+  <PropertyGroup>
+    <RepositoryRoot>$(MSBuildThisFileDirectory)</RepositoryRoot>
+  </PropertyGroup>
+
+  <!-- Common Project Metadata -->
+  <PropertyGroup>
+    <Product>RecroGrid Framework</Product>
+    <Description>RecroGrid Framework Core includes server-side functionality and API endpoints.</Description>
+    <Company>Recrovit Kft.</Company>
+    <Authors>$(Company)</Authors>
+    <Copyright>Copyright (c) Recrovit Kft.</Copyright>
+    <RepositoryUrl>https://github.com/Recrovit/rgf-core</RepositoryUrl>
+  </PropertyGroup>
+
+  <!-- Versioning -->
+  <PropertyGroup>
+    <Version>10.1.0</Version>
+    <FileVersion>$(Version).1$([System.DateTime]::Now.ToString('MMdd'))</FileVersion>
+    <InformationalVersion>$(FileVersion)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+
+  <!-- Publishing -->
+  <PropertyGroup Condition="'$(IsPackable)' != 'false'">
+    <PackageProjectUrl>https://recrogridframework.com/</PackageProjectUrl>
+    <PackageTags>recrogrid dotnet ef api</PackageTags>
+    <PackageLicenseExpression>LGPL-2.1-or-later</PackageLicenseExpression>
+    <PackageRequireLicenseAcceptance>true</PackageRequireLicenseAcceptance>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageOutputPath>$(RepositoryRoot)..\dist</PackageOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(RepositoryRoot)README.md')">
+    <None Include="$(RepositoryRoot)README.md" Pack="true" PackagePath="" />
+  </ItemGroup>
+
+</Project>
