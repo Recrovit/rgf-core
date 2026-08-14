@@ -8,15 +8,26 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <Version>10.2.1</Version>
+    <Version>10.3.0</Version>
     <FileVersion>$(Version).1$([System.DateTime]::Now.ToString('MMdd'))</FileVersion>
     <InformationalVersion>$(FileVersion)</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="RecroGrid" Version="10.2.1" Condition="'$(Configuration)'=='Release'" />
-    <ProjectReference Include="..\..\RGF.Legacy\src\RGF.csproj" Condition="'$(Configuration)'=='Debug'" />
+    <ProjectReference Include="..\..\rgf-legacy\src\RGF.csproj" Condition="'$(Configuration)'=='Debug'" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(LocalRecrovitAi)')">
+    <ProjectReference Include="$(LocalRecrovitAi)" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(LocalRgfLegacy)')">
+    <ProjectReference Include="$(LocalRgfLegacy)" />
+  </ItemGroup>
+
+  <ItemGroup Condition="!Exists('$(LocalRgfLegacy)')">
+    <PackageReference Include="RecroGrid" Version="10.3.0" Condition="'$(Configuration)'=='Release'" />
   </ItemGroup>
 
   <ItemGroup>

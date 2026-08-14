@@ -12,6 +12,11 @@
     <RepositoryRoot>$(MSBuildThisFileDirectory)</RepositoryRoot>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <LocalRgfLegacy>$(MSBuildThisFileDirectory)..\rgf-legacy\src\RGF.csproj</LocalRgfLegacy>
+    <LocalRecrovitAi>$(MSBuildThisFileDirectory)..\recrovit-ai\src\Recrovit.AI.Runtime\Recrovit.AI.Runtime.csproj</LocalRecrovitAi>
+  </PropertyGroup>
+
   <!-- Common Project Metadata -->
   <PropertyGroup>
     <Product>RecroGrid Framework</Product>
