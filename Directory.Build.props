@@ -12,6 +12,10 @@
     <RepositoryRoot>$(MSBuildThisFileDirectory)</RepositoryRoot>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <LocalRgfLegacy>$(MSBuildThisFileDirectory)..\rgf-legacy\src\RGF.csproj</LocalRgfLegacy>
+  </PropertyGroup>
+
   <!-- Common Project Metadata -->
   <PropertyGroup>
     <Product>RecroGrid Framework</Product>
