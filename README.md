@@ -15,3 +15,7 @@
 [![NuGet Version](https://img.shields.io/nuget/v/Recrovit.RecroGridFramework.Client.Blazor.SessionAuth.svg?label=Recrovit.RecroGridFramework.Client.Blazor.SessionAuth)](https://www.nuget.org/packages/Recrovit.RecroGridFramework.Client.Blazor.SessionAuth/)
 
 Official Website: [RecroGrid Framework](https://RecroGridFramework.com)
+
+## Developer documentation
+
+- [Recroby architecture and integration](docs/architecture/Recroby.md)

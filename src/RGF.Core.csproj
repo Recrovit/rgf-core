@@ -14,12 +14,16 @@
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
-  <ItemGroup>
-    <ProjectReference Include="..\..\rgf-legacy\src\RGF.csproj" Condition="'$(Configuration)'=='Debug'" />
+  <!--<ItemGroup Condition="Exists('$(LocalRecrovitAi)')">
+    <ProjectReference Include="$(LocalRecrovitAi)" />
   </ItemGroup>
 
-  <ItemGroup Condition="Exists('$(LocalRecrovitAi)')">
-    <ProjectReference Include="$(LocalRecrovitAi)" />
+  <ItemGroup Condition="!Exists('$(LocalRecrovitAi)')">
+    <PackageReference Include="Recrovit.AI.Runtime" Version="10.0.0" />
+  </ItemGroup>-->
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\recrovit-ai\src\Recrovit.AI.Runtime\Recrovit.AI.Runtime.csproj" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('$(LocalRgfLegacy)')">
@@ -27,7 +31,7 @@
   </ItemGroup>
 
   <ItemGroup Condition="!Exists('$(LocalRgfLegacy)')">
-    <PackageReference Include="RecroGrid" Version="10.3.0" Condition="'$(Configuration)'=='Release'" />
+    <PackageReference Include="RecroGrid" Version="10.3.0" />
   </ItemGroup>
 
   <ItemGroup>
