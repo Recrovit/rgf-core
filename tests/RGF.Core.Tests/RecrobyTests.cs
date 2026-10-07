@@ -21,6 +21,51 @@ namespace RGF.Core.Tests;
 public sealed class RecrobyTests
 {
     [Fact]
+    public async Task DefaultWorkflowUsesNativeIntentDecisionAndTwoTerminalBranches()
+    {
+        await using var fixture = new Fixture();
+        var workflow = fixture.DefaultWorkflow;
+        Assert.Equal("rgf.recroby", workflow.Id);
+        Assert.Equal("rgf.recroby.intent", workflow.EntryAgentId);
+        var intent = Assert.Single(workflow.Agents, agent => agent.Id == workflow.EntryAgentId);
+        Assert.Equal(AgentType.Decision, intent.Type);
+        Assert.Equal(DecisionExecutionMode.AI, intent.DecisionExecutionMode);
+        Assert.True(intent.IncludeConversationHistory);
+        Assert.False(intent.AllowInputRequest);
+        Assert.Equal(3, workflow.Agents.Count);
+        Assert.Equal(2, workflow.Relations.Count);
+        Assert.All(workflow.Relations, relation => Assert.Equal(intent.Id, relation.SourceAgentId));
+        Assert.Equal(new[] { "application", "chat" }, workflow.Relations.Select(relation => relation.DecisionKey).Order());
+        foreach (var key in new[] { "chat", "application" })
+        {
+            var relation = Assert.Single(workflow.Relations, relation => relation.DecisionKey == key);
+            Assert.Equal($"rgf.recroby.{key}", relation.TargetAgentId);
+            var terminal = Assert.Single(workflow.Agents, agent => agent.Id == relation.TargetAgentId);
+            Assert.Equal(AgentType.Executor, terminal.Type);
+            Assert.Equal(ExecutorExecutionMode.AI, terminal.ExecutorExecutionMode);
+            Assert.False(terminal.AllowInputRequest);
+            Assert.Equal("rgf.recroby.response", terminal.OutputContractId);
+            Assert.Empty(terminal.AllowedToolIds);
+            Assert.DoesNotContain(workflow.Relations, relation => relation.SourceAgentId == terminal.Id);
+            if (key == "chat") Assert.True(terminal.IncludeConversationHistory);
+        }
+    }
+
+    [Theory]
+    [InlineData("chat", "default answer")]
+    [InlineData("application", "Application-specific request handling is not implemented yet.")]
+    public async Task IntentRoutesToSelectedTerminalResponse(string decisionKey, string expectedAnswer)
+    {
+        await using var fixture = new Fixture();
+        fixture.DefaultChat.DecisionKeys.Enqueue(decisionKey);
+        var response = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "routing input" }, Token);
+        Assert.True(response.Success);
+        Assert.Equal("Completed", response.WorkflowStatus);
+        Assert.Equal(expectedAnswer, response.Message);
+        Assert.Equal(new[] { "intent", decisionKey }, fixture.DefaultChat.Invocations);
+    }
+
+    [Fact]
     public async Task NewConversationAndCompletedTurnUseNativeHistoryAndIssueProtectedIdentity()
     {
         await using var fixture = new Fixture();
@@ -34,9 +79,19 @@ public sealed class RecrobyTests
         var next = await fixture.Service.ExecuteAsync("owner", Reply(first, "second"), Token);
         Assert.Equal(first.ConversationId, next.ConversationId);
         Assert.NotEqual(first.WorkflowRunId, next.WorkflowRunId);
-        Assert.Contains(fixture.DefaultChat.Messages.Last(), message => message.Text == "first");
-        Assert.Contains(fixture.DefaultChat.Messages.Last(), message => message.Text == "default answer");
-        Assert.Contains(fixture.DefaultChat.Messages.Last(), message => message.Text == "second");
+        Assert.True(next.Success);
+        Assert.Equal("Completed", next.WorkflowStatus);
+        Assert.Equal("default answer", next.Message);
+        Assert.Equal(new[] { "intent", "chat", "intent", "chat" }, fixture.DefaultChat.Invocations);
+        foreach (var messages in fixture.DefaultChat.Messages.Skip(2))
+        {
+            Assert.Equal(new[]
+            {
+                (ChatRole.User, "first"),
+                (ChatRole.Assistant, "default answer"),
+                (ChatRole.User, "second")
+            }, messages.Select(message => (message.Role, message.Text)));
+        }
     }
 
     [Fact]
@@ -168,7 +223,7 @@ public sealed class RecrobyTests
         Assert.Equal("alternate answer", first.Message);
         var next = await fixture.Service.ExecuteAsync("owner", Reply(first, "second"), Token);
         Assert.Equal("alternate answer", next.Message);
-        Assert.Equal(2, fixture.AlternateChat.Messages.Count);
+        Assert.Equal(new[] { "intent", "chat", "intent", "chat" }, fixture.AlternateChat.Invocations);
         Assert.Empty(fixture.DefaultChat.Messages);
         await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.ExecuteAsync("owner",
             new() { CurrentUserMessage = "bad", AiModelOverride = "missing" }, Token));
@@ -276,6 +331,7 @@ public sealed class RecrobyTests
         public ChatClient AlternateChat { get; } = new("alternate answer");
         public AskOnce Decision { get; } = new();
         public RgfRecrobyService Service { get; }
+        public WorkflowDefinition DefaultWorkflow => provider.GetRequiredService<WorkflowRegistry>().Get("rgf.recroby");
         public HostExtension? Extension { get; }
         public IDataProtectionProvider Protection { get; } = new EphemeralDataProtectionProvider();
         public Fixture(bool custom = false, bool aiAfterResume = false)
@@ -321,14 +377,31 @@ public sealed class RecrobyTests
     private sealed class ChatClient(string answer) : IChatClient
     {
         public List<ChatMessage[]> Messages { get; } = [];
+        public List<string> Invocations { get; } = [];
+        public Queue<string> DecisionKeys { get; } = new();
         public void Dispose() { }
         public object? GetService(Type type, object? key = null) => type.IsInstanceOfType(this) ? this : null;
         public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
             Messages.Add(messages.ToArray());
+            var format = Assert.IsType<ChatResponseFormatJson>(options?.ResponseFormat);
+            var output = format.Schema!.Value.GetProperty("properties").GetProperty("output");
+            if (output.TryGetProperty("properties", out var properties) && properties.TryGetProperty("decisionKey", out var decisionKeySchema))
+            {
+                Assert.Contains("Classify the user's current request.", options!.Instructions);
+                var key = DecisionKeys.Count == 0 ? "chat" : DecisionKeys.Dequeue();
+                Assert.Contains($"\"{key}\"", decisionKeySchema.GetRawText());
+                Invocations.Add("intent");
+                return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant,
+                    JsonSerializer.Serialize(new { userMessage = (string?)null, output = new { decisionKey = key } }))));
+            }
+            Assert.Contains("string", output.GetProperty("type").EnumerateArray().Select(type => type.GetString()));
+            var application = options!.Instructions?.Contains("application-specific request handling is not implemented yet.", StringComparison.Ordinal) == true;
+            Invocations.Add(application ? "application" : "chat");
+            var response = application ? "Application-specific request handling is not implemented yet." : answer;
             return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant,
-                JsonSerializer.Serialize(new { userMessage = answer, output = answer }))));
+                JsonSerializer.Serialize(new { userMessage = response, output = response }))));
         }
         public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
             => throw new NotSupportedException();
