@@ -21,6 +21,26 @@ namespace RGF.Core.Tests;
 public sealed class RecrobyTests
 {
     [Fact]
+    public async Task GenericConversationBypassesApplicationExtensionAndIgnoresCustomWorkflowSelection()
+    {
+        await using var fixture = new Fixture(custom: true);
+        fixture.Extension!.Allowed = false;
+        fixture.DefaultChat.DecisionKeys.Enqueue("chat");
+        var first = await fixture.Service.ExecuteAsync("owner", new()
+        {
+            CurrentUserMessage = "Hello", CustomParams = new() { ["workflowId"] = "host.workflow" }
+        }, Token);
+        Assert.True(first.Success);
+        fixture.DefaultChat.DecisionKeys.Enqueue("chat");
+        var next = await fixture.Service.ExecuteAsync("owner", Reply(first, "Continue"), new HostContext("owner", 99), Token);
+        Assert.True(next.Success);
+        Assert.Equal(first.ConversationId, next.ConversationId);
+        Assert.Equal(0, fixture.Extension.Prepared);
+        Assert.Equal(0, fixture.Extension.Validated);
+        Assert.Empty(fixture.Decision.Contexts);
+    }
+
+    [Fact]
     public async Task DefaultWorkflowUsesNativeIntentDecisionAndTwoTerminalBranches()
     {
         await using var fixture = new Fixture();
@@ -136,7 +156,7 @@ public sealed class RecrobyTests
     public async Task InvalidIdentityCannotReachExtensionOrResume(string attack)
     {
         await using var fixture = new Fixture(custom: true);
-        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, Token);
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
         var request = Reply(first, "intrusion");
         var user = "owner";
         switch (attack)
@@ -159,7 +179,7 @@ public sealed class RecrobyTests
     public async Task ReplayedContinuationIsRejectedByTheExistingRuntime()
     {
         await using var fixture = new Fixture(custom: true);
-        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, Token);
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
         Assert.True((await fixture.Service.ExecuteAsync("owner", Reply(first, "once"), Token)).Success);
         var replay = await fixture.Service.ExecuteAsync("owner", Reply(first, "twice"), Token);
         Assert.False(replay.Success);
@@ -174,7 +194,7 @@ public sealed class RecrobyTests
     public async Task ProtectedIdentityMustMatchStoredRunBeforeApplicationValidation(string field)
     {
         await using var fixture = new Fixture(custom: true);
-        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, Token);
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
         var protector = fixture.Protection.CreateProtector("RGF.Recroby.ConversationIdentity.v1");
         var identity = System.Text.Json.Nodes.JsonNode.Parse(protector.Unprotect(first.ConversationToken!))!;
         identity[field] = "different";
@@ -198,7 +218,7 @@ public sealed class RecrobyTests
     public async Task ExtensionAuthorizationAlsoRunsBeforeResume()
     {
         await using var fixture = new Fixture(custom: true, aiAfterResume: true);
-        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, Token);
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
         fixture.Extension!.Allowed = false;
         await Assert.ThrowsAsync<UnauthorizedAccessException>(() => fixture.Service.ExecuteAsync("owner", Reply(first, "blocked"), Token));
         Assert.Single(fixture.Decision.Contexts);
@@ -233,7 +253,7 @@ public sealed class RecrobyTests
     public async Task PerRunModelOverrideIsRetainedUntilAIExecutesAfterResume()
     {
         await using var fixture = new Fixture(custom: true, aiAfterResume: true);
-        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first", AiModelOverride = "alternate" }, Token);
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first", AiModelOverride = "alternate" }, new HostContext("owner", 42), Token);
         Assert.Equal("WaitingForInput", first.WorkflowStatus);
         Assert.Empty(fixture.AlternateChat.Messages);
         var next = await fixture.Service.ExecuteAsync("owner", Reply(first, "continue"), Token);
@@ -248,7 +268,7 @@ public sealed class RecrobyTests
     public async Task PendingRunCannotChangeModelAndCancellationPropagates()
     {
         await using var fixture = new Fixture(custom: true);
-        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first", AiModelOverride = "alternate" }, Token);
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first", AiModelOverride = "alternate" }, new HostContext("owner", 42), Token);
         var request = Reply(first, "detail");
         request.AiModelOverride = "default";
         await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.ExecuteAsync("owner", request, Token));

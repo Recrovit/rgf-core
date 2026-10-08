@@ -11,7 +11,8 @@ namespace Recrovit.RecroGridFramework.Core.AI.Recroby;
 
 /// <summary>Owns authorized conversation turns over the single Recrovit.AI workflow runtime.</summary>
 public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunInspector runs, IDataProtectionProvider protection,
-    IRgfRecrobyExtension extension, ILogger<RgfRecrobyService> logger, AiRouteCatalog? routes = null)
+    IRgfRecrobyExtension extension, ILogger<RgfRecrobyService> logger, AiRouteCatalog? routes = null,
+    IEnumerable<IRgfRecrobyExtension>? extensions = null)
 {
     private readonly IDataProtector protector = protection.CreateProtector("RGF.Recroby.ConversationIdentity.v1");
 
@@ -37,8 +38,19 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
                 || run.WorkflowId != identity.WorkflowId)
                 throw new UnauthorizedAccessException("The workflow run does not match the protected conversation identity.");
         }
-        await extension.ValidateAsync(new RgfRecrobyValidationContext(userId, identity?.ConversationId,
-            identity?.RequestId is not null, run?.HostContext), request, cancellationToken);
+        var generic = identity is not null ? identity.WorkflowId == "rgf.recroby" : initialHostContext is null;
+        IRgfRecrobyExtension? selectedExtension = null;
+        if (!generic)
+        {
+            var candidates = (extensions ?? [extension])
+                .Where(candidate => candidate.CanHandle(identity?.WorkflowId, run?.HostContext ?? initialHostContext))
+                .ToArray();
+            if (candidates.Length != 1)
+                throw new UnauthorizedAccessException("The trusted workflow context must identify exactly one application extension.");
+            selectedExtension = candidates[0];
+            await selectedExtension.ValidateAsync(new RgfRecrobyValidationContext(userId, identity?.ConversationId,
+                identity?.RequestId is not null, run?.HostContext), request, cancellationToken);
+        }
 
         // A pending run keeps its original model settings along with its context and input.
         var modelOverride = string.IsNullOrWhiteSpace(request.AiModelOverride) ? identity?.ModelOverride : request.AiModelOverride;
@@ -49,15 +61,26 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
         AIExecutionOptions? executionOptions = null;
         if (identity?.RequestId is null)
         {
-            execution = await extension.PrepareAsync(new RgfRecrobyContext(userId, identity?.ConversationId)
-                { InitialHostContext = initialHostContext }, request, cancellationToken);
+            var context = new RgfRecrobyContext(userId, identity?.ConversationId) { InitialHostContext = generic ? null : initialHostContext };
+            execution = generic
+                ? new RgfRecrobyExecution("rgf.recroby", context, [])
+                : await selectedExtension!.PrepareAsync(context, request, cancellationToken);
             ArgumentException.ThrowIfNullOrWhiteSpace(execution.WorkflowId);
             ArgumentNullException.ThrowIfNull(execution.HostContext);
             ArgumentNullException.ThrowIfNull(execution.InputData);
             if (identity is not null && identity.WorkflowId != execution.WorkflowId)
                 throw new UnauthorizedAccessException("A conversation cannot be continued with another workflow.");
-            executionOptions = ResolveModel(modelOverride);
+            executionOptions = routes is { HasConfiguredProvider: false } ? null : ResolveModel(modelOverride);
         }
+
+        if (routes is { HasConfiguredProvider: false })
+            return new RgfAiResponse
+            {
+                Success = false, ErrorCode = RgfAiErrorCodes.AiProviderNotConfigured,
+                Message = "No AI provider is configured. Configure an AI provider and model to use Recroby.",
+                ConversationId = identity?.ConversationId ?? string.Empty,
+                ConversationToken = request.ConversationToken
+            };
 
         try
         {

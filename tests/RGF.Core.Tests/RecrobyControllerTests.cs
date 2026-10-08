@@ -19,6 +19,21 @@ namespace RGF.Core.Tests;
 
 public sealed class RecrobyControllerTests
 {
+    [Fact]
+    public async Task MissingProviderReturnsTypedFailureWithoutStartingWorkflow()
+    {
+        var fixture = new Fixture(providerMissing: true);
+        var result = await fixture.Controller.ExecuteAsync(new() { CurrentUserMessage = "Hello" }, Token);
+        var response = Assert.IsType<RgfAiResponse>(Assert.IsType<OkObjectResult>(result.Result).Value);
+        Assert.False(response.Success);
+        Assert.Equal(RgfAiErrorCodes.AiProviderNotConfigured, response.ErrorCode);
+        Assert.Empty(response.ConversationId);
+        Assert.Null(response.ConversationToken);
+        Assert.Null(response.WorkflowRunId);
+        Assert.Equal(0, fixture.Workflows.Calls);
+        Assert.Null(fixture.Extension.Request);
+    }
+
     [Theory]
     [InlineData(WorkflowStatus.Completed, true)]
     [InlineData(WorkflowStatus.Failed, false)]
@@ -45,8 +60,8 @@ public sealed class RecrobyControllerTests
         Assert.Equal(status.ToString(), response.WorkflowStatus);
         Assert.NotEmpty(response.ConversationToken!);
         Assert.Same(fixture.User, fixture.Identity.Principal);
-        Assert.Equal("server-user", fixture.Extension.UserId);
-        Assert.Same(request, fixture.Extension.Request);
+        Assert.Null(fixture.Extension.UserId);
+        Assert.Null(fixture.Extension.Request);
         Assert.Equal("server-user", Assert.IsType<RgfRecrobyContext>(fixture.Workflows.Context).UserId);
         Assert.Equal("Hello", fixture.Workflows.Instruction);
         Assert.Equal(Token, fixture.Workflows.Token);
@@ -109,12 +124,13 @@ public sealed class RecrobyControllerTests
         public IDataProtectionProvider Protection { get; } = new EphemeralDataProtectionProvider();
         public RgfRecrobyController Controller { get; }
 
-        public Fixture()
+        public Fixture(bool providerMissing = false)
         {
             var identity = DispatchProxy.Create<IRgfIdentityService, IdentityProxy>();
             Identity = (IdentityProxy)identity;
             var service = new RgfRecrobyService(Workflows, Workflows, Protection, Extension,
-                NullLogger<RgfRecrobyService>.Instance);
+                NullLogger<RgfRecrobyService>.Instance,
+                providerMissing ? new Recrovit.AI.Runtime.AiRouteCatalog(new()) : null);
             Controller = new(service, identity)
             { ControllerContext = new() { HttpContext = new DefaultHttpContext { User = User } } };
         }

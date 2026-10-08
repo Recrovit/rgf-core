@@ -8,6 +8,10 @@ namespace Recrovit.RecroGridFramework.Core.AI.Recroby.Extensions;
 /// Resume retains the original host context and input in Recrovit.AI; preparation runs only for a new run.</remarks>
 public interface IRgfRecrobyExtension
 {
+    /// <summary>Selects an extension using protected workflow identity or trusted server-side context.</summary>
+    bool CanHandle(string? workflowId, IWorkflowHostContext? hostContext)
+        => workflowId != "rgf.recroby" && (workflowId is not null || hostContext is not null);
+
     /// <summary>Application authorization on every turn, including resume, after token verification.</summary>
     ValueTask ValidateAsync(RgfRecrobyValidationContext context, RgfAiRequest request, CancellationToken cancellationToken)
         => ValueTask.CompletedTask;

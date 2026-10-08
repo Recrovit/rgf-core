@@ -7,6 +7,12 @@ public static class RgfRecrobyWorkflowConfigurationExtensions
     /// <summary>Optional default intent workflow. Applications can register and select their own workflow instead.</summary>
     public static void AddDefaultRecrobyWorkflow(this RecrovitWorkflowConfiguration configuration)
     {
+        try
+        {
+            configuration.Workflows.Get("rgf.recroby");
+            return;
+        }
+        catch (WorkflowException exception) when (exception.Code == WorkflowErrorCode.UnknownWorkflow) { }
         configuration.Contracts.Register<string>("rgf.recroby.response");
         configuration.Workflows.Register(new WorkflowDefinition
         {
