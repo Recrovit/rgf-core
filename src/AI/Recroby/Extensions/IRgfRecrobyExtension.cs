@@ -9,8 +9,10 @@ namespace Recrovit.RecroGridFramework.Core.AI.Recroby.Extensions;
 public interface IRgfRecrobyExtension
 {
     /// <summary>Selects an extension using protected workflow identity or trusted server-side context.</summary>
-    bool CanHandle(string? workflowId, IWorkflowHostContext? hostContext)
-        => workflowId != "rgf.recroby" && (workflowId is not null || hostContext is not null);
+    /// <remarks>When workflowId is non-null, select using the existing conversation's protected workflow identity.
+    /// When workflowId is null, select a new conversation using only trusted server-side context.
+    /// This method only selects an extension; authorization remains in ValidateAsync and PrepareAsync.</remarks>
+    bool CanHandle(string? workflowId, IWorkflowHostContext? hostContext);
 
     /// <summary>Application authorization on every turn, including resume, after token verification.</summary>
     ValueTask ValidateAsync(RgfRecrobyValidationContext context, RgfAiRequest request, CancellationToken cancellationToken)

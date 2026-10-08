@@ -138,6 +138,9 @@ public sealed class RecrobyControllerTests
 
     private sealed class RecordingExtension : IRgfRecrobyExtension
     {
+        public bool CanHandle(string? workflowId, IWorkflowHostContext? hostContext)
+            => workflowId == "test.workflow";
+
         public string? UserId { get; private set; }
         public RgfAiRequest? Request { get; private set; }
         public ValueTask<RgfRecrobyExecution> PrepareAsync(RgfRecrobyContext context, RgfAiRequest request,

@@ -21,9 +21,67 @@ namespace RGF.Core.Tests;
 public sealed class RecrobyTests
 {
     [Fact]
+    public async Task ExactlyOneMatchingExtensionExecutesDespiteManipulatedCustomParams()
+    {
+        await using var fixture = new Fixture(custom: true, multiple: true);
+        var first = await fixture.Service.ExecuteAsync("owner", new()
+        {
+            CurrentUserMessage = "first",
+            CustomParams = new() { ["workflowId"] = "other.workflow", ["hostContext"] = new OtherContext("owner") }
+        }, new HostContext("owner", 42), Token);
+        Assert.True(first.Success);
+        Assert.Equal("WaitingForInput", first.WorkflowStatus);
+        Assert.Equal(42, Assert.IsType<HostContext>(Assert.Single(fixture.Decision.Contexts)).Selection);
+        Assert.Equal(1, fixture.Extension!.Validated);
+        Assert.Equal(1, fixture.Extension.Prepared);
+        Assert.Equal(0, fixture.OtherExtension!.Validated);
+        Assert.Equal(0, fixture.OtherExtension.Prepared);
+        var completed = await fixture.Service.ExecuteAsync("owner", Reply(first, "detail"), Token);
+        Assert.True(completed.Success);
+        Assert.Equal("Completed", completed.WorkflowStatus);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ZeroOrMultipleMatchesAreRejectedBeforeAuthorizationAndPreparation(bool ambiguous)
+    {
+        await using var fixture = new Fixture(custom: true, multiple: true, ambiguous: ambiguous);
+        IWorkflowHostContext context = ambiguous ? new HostContext("owner", 42) : new RgfRecrobyContext("owner");
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() => fixture.Service.ExecuteAsync(
+            "owner", new() { CurrentUserMessage = "first" }, context, Token));
+        Assert.Equal(0, fixture.Extension!.Validated);
+        Assert.Equal(0, fixture.Extension.Prepared);
+        Assert.Equal(0, fixture.OtherExtension!.Validated);
+        Assert.Equal(0, fixture.OtherExtension.Prepared);
+        Assert.Empty(fixture.Decision.Contexts);
+        Assert.Empty(fixture.DefaultChat.Invocations);
+    }
+
+    [Fact]
+    public async Task ProtectedWorkflowSelectsOriginalExtensionForPendingAndCompletedTurns()
+    {
+        await using var fixture = new Fixture(custom: true, multiple: true);
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
+        var request = Reply(first, "detail");
+        request.CustomParams = new() { ["workflowId"] = "other.workflow" };
+        var completed = await fixture.Service.ExecuteAsync("owner", request, new OtherContext("owner"), Token);
+        Assert.True(completed.Success);
+        Assert.Equal("Completed", completed.WorkflowStatus);
+        Assert.Same(fixture.Decision.Contexts[0], fixture.Decision.Contexts[1]);
+        var next = await fixture.Service.ExecuteAsync("owner", Reply(completed, "next"), new OtherContext("owner"), Token);
+        Assert.True(next.Success);
+        Assert.NotEqual(completed.WorkflowRunId, next.WorkflowRunId);
+        Assert.Equal(3, fixture.Extension!.Validated);
+        Assert.Equal(2, fixture.Extension.Prepared);
+        Assert.Equal(0, fixture.OtherExtension!.Validated);
+        Assert.Equal(0, fixture.OtherExtension.Prepared);
+    }
+
+    [Fact]
     public async Task GenericConversationBypassesApplicationExtensionAndIgnoresCustomWorkflowSelection()
     {
-        await using var fixture = new Fixture(custom: true);
+        await using var fixture = new Fixture(custom: true, multiple: true);
         fixture.Extension!.Allowed = false;
         fixture.DefaultChat.DecisionKeys.Enqueue("chat");
         var first = await fixture.Service.ExecuteAsync("owner", new()
@@ -37,6 +95,10 @@ public sealed class RecrobyTests
         Assert.Equal(first.ConversationId, next.ConversationId);
         Assert.Equal(0, fixture.Extension.Prepared);
         Assert.Equal(0, fixture.Extension.Validated);
+        Assert.Empty(fixture.Extension.Selections);
+        Assert.Empty(fixture.OtherExtension!.Selections);
+        Assert.Equal(0, fixture.OtherExtension.Validated);
+        Assert.Equal(0, fixture.OtherExtension.Prepared);
         Assert.Empty(fixture.Decision.Contexts);
     }
 
@@ -303,9 +365,17 @@ public sealed class RecrobyTests
     { ConversationId = response.ConversationId, ConversationToken = response.ConversationToken, CurrentUserMessage = text };
 
     private sealed record HostContext(string Owner, int Selection) : RgfRecrobyContext(Owner);
+    private sealed record OtherContext(string Owner) : RgfRecrobyContext(Owner);
 
-    private sealed class HostExtension(IStructuredContractRegistry contracts) : IRgfRecrobyExtension
+    private class HostExtension(IStructuredContractRegistry contracts) : IRgfRecrobyExtension
     {
+        public List<(string? WorkflowId, IWorkflowHostContext? Context)> Selections { get; } = [];
+        public virtual bool CanHandle(string? workflowId, IWorkflowHostContext? hostContext)
+        {
+            Selections.Add((workflowId, hostContext));
+            return workflowId is not null ? workflowId == "host.workflow" : hostContext is HostContext;
+        }
+
         public int Prepared { get; private set; }
         public int Validated { get; private set; }
         public bool Allowed { get; set; } = true;
@@ -323,6 +393,18 @@ public sealed class RecrobyTests
             var selection = (context.InitialHostContext as HostContext)?.Selection ?? 42;
             return ValueTask.FromResult(new RgfRecrobyExecution("host.workflow", new HostContext(context.UserId, selection),
                 [new AgentInputData { Source = AgentInputSource.Application, Role = "domain", Value = contracts.Serialize("host.input", "domain input") }]));
+        }
+    }
+
+    private sealed class OtherExtension(IStructuredContractRegistry contracts) : HostExtension(contracts)
+    {
+        public bool Ambiguous { get; set; }
+        public override bool CanHandle(string? workflowId, IWorkflowHostContext? hostContext)
+        {
+            Selections.Add((workflowId, hostContext));
+            return Ambiguous
+                ? workflowId is not null ? workflowId == "host.workflow" : hostContext is HostContext
+                : workflowId is not null ? workflowId == "other.workflow" : hostContext is OtherContext;
         }
     }
 
@@ -353,8 +435,9 @@ public sealed class RecrobyTests
         public RgfRecrobyService Service { get; }
         public WorkflowDefinition DefaultWorkflow => provider.GetRequiredService<WorkflowRegistry>().Get("rgf.recroby");
         public HostExtension? Extension { get; }
+        public OtherExtension? OtherExtension { get; }
         public IDataProtectionProvider Protection { get; } = new EphemeralDataProtectionProvider();
-        public Fixture(bool custom = false, bool aiAfterResume = false)
+        public Fixture(bool custom = false, bool aiAfterResume = false, bool multiple = false, bool ambiguous = false)
         {
             Decision.AiAfterResume = aiAfterResume;
             var services = new ServiceCollection();
@@ -386,10 +469,17 @@ public sealed class RecrobyTests
             }));
             services.AddSingleton(Protection);
             if (custom) services.AddRgfRecroby<HostExtension>(); else services.AddRgfRecroby();
+            if (multiple) services.AddRgfRecroby<OtherExtension>();
             provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
             scope = provider.CreateAsyncScope();
             Service = scope.ServiceProvider.GetRequiredService<RgfRecrobyService>();
-            if (custom) Extension = Assert.IsType<HostExtension>(scope.ServiceProvider.GetRequiredService<IRgfRecrobyExtension>());
+            var extensions = scope.ServiceProvider.GetServices<IRgfRecrobyExtension>().ToArray();
+            if (custom) Extension = Assert.Single(extensions.OfType<HostExtension>(), candidate => candidate.GetType() == typeof(HostExtension));
+            if (multiple)
+            {
+                OtherExtension = Assert.Single(extensions.OfType<OtherExtension>());
+                OtherExtension.Ambiguous = ambiguous;
+            }
         }
         public async ValueTask DisposeAsync() { await scope.DisposeAsync(); await provider.DisposeAsync(); }
     }
