@@ -435,3 +435,5 @@ src/Directory.Build.targets
 /.codex/config.toml
 /.codex/rules/default.rules
 **/AGENTS.md
+
+/recroby.http

@@ -39,6 +39,7 @@
 
   <ItemGroup Condition="Exists('$(RepositoryRoot)README.md')">
     <None Include="$(RepositoryRoot)README.md" Pack="true" PackagePath="" />
+    <None Include="$(RepositoryRoot)CHANGELOG.md" Pack="false" />
   </ItemGroup>
 
 </Project>

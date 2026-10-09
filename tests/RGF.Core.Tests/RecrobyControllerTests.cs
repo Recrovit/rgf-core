@@ -19,6 +19,43 @@ namespace RGF.Core.Tests;
 
 public sealed class RecrobyControllerTests
 {
+    [Theory]
+    [InlineData(null, null, null)]
+    [InlineData("p/model", null, "high")]
+    [InlineData("p/model", "low", "low")]
+    [InlineData(null, "low", "low")]
+    public async Task EffortUsesCatalogDefaultsAndDoesNotIntroduceReasoningMode(string? model, string? effort, string? expected)
+    {
+        var fixture = new Fixture(configured: true);
+        await fixture.Controller.ExecuteAsync(new() { CurrentUserMessage = "Hello", AiModelOverride = model,
+            AiReasoningEffortOverride = effort }, Token);
+        Assert.Equal(expected, fixture.Workflows.Options?.Reasoning?.Effort);
+        Assert.Equal(model is not null && effort is null ? AIReasoningMode.Enabled : (AIReasoningMode?)null,
+            fixture.Workflows.Options?.Reasoning?.Mode);
+        Assert.Equal(model is null && effort is null ? null : "p/model", fixture.Workflows.Options?.ExecutionRoute);
+        var catalogResult = await fixture.Controller.GetCatalogAsync(Token);
+        var catalog = Assert.IsType<RgfAiCatalogResponse>(Assert.IsType<OkObjectResult>(catalogResult.Result).Value);
+        Assert.Equal("p", catalog.DefaultProvider);
+        Assert.Equal(new[] { "low", "high" }, Assert.Single(Assert.Single(catalog.Providers).Models).Efforts);
+        var invalid = await fixture.Controller.ExecuteAsync(new() { CurrentUserMessage = "Hello",
+            AiModelOverride = "p/model", AiReasoningEffortOverride = "invalid" }, Token);
+        Assert.Equal(400, Assert.IsType<ObjectResult>(invalid.Result).StatusCode);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CatalogIsAvailableWithoutStartingWorkflow(bool providerMissing)
+    {
+        var fixture = new Fixture(providerMissing);
+        var result = await fixture.Controller.GetCatalogAsync(Token);
+        var catalog = Assert.IsType<RgfAiCatalogResponse>(Assert.IsType<OkObjectResult>(result.Result).Value);
+        Assert.Empty(catalog.Providers);
+        Assert.Equal(0, fixture.Workflows.Calls);
+        fixture.Identity.UserId = null;
+        Assert.IsType<UnauthorizedResult>((await fixture.Controller.GetCatalogAsync(Token)).Result);
+    }
+
     [Fact]
     public async Task MissingProviderReturnsTypedFailureWithoutStartingWorkflow()
     {
@@ -124,13 +161,20 @@ public sealed class RecrobyControllerTests
         public IDataProtectionProvider Protection { get; } = new EphemeralDataProtectionProvider();
         public RgfRecrobyController Controller { get; }
 
-        public Fixture(bool providerMissing = false)
+        public Fixture(bool providerMissing = false, bool configured = false)
         {
             var identity = DispatchProxy.Create<IRgfIdentityService, IdentityProxy>();
             Identity = (IdentityProxy)identity;
             var service = new RgfRecrobyService(Workflows, Workflows, Protection, Extension,
                 NullLogger<RgfRecrobyService>.Instance,
-                providerMissing ? new Recrovit.AI.Runtime.AiRouteCatalog(new()) : null);
+                providerMissing ? new Recrovit.AI.Runtime.AiRouteCatalog(new()) : configured
+                    ? new Recrovit.AI.Runtime.AiRouteCatalog(new()
+                    {
+                        DefaultProvider = "p", Providers = new() { ["p"] = new()
+                        { DefaultModel = "model", Models = new() { ["model"] = "native" },
+                            Reasoning = new() { Modes = [AIReasoningMode.Enabled], DefaultMode = AIReasoningMode.Enabled,
+                                Efforts = ["low", "high"], DefaultEffort = "high" } } }
+                    }) : null);
             Controller = new(service, identity)
             { ControllerContext = new() { HttpContext = new DefaultHttpContext { User = User } } };
         }
@@ -159,12 +203,14 @@ public sealed class RecrobyControllerTests
         public string? Instruction { get; private set; }
         public IWorkflowHostContext? Context { get; private set; }
         public CancellationToken Token { get; private set; }
+        public AIExecutionOptions? Options { get; private set; }
         public Task<WorkflowOutput> StartWorkflowAsync(string workflowId, string? conversationId = null,
             string? userInstruction = null, IReadOnlyList<AgentInputData>? inputData = null,
             CancellationToken cancellationToken = default, IWorkflowHostContext? hostContext = null,
             AIExecutionOptions? executionOptions = null)
         {
             Calls++;
+            Options = executionOptions;
             Instruction = userInstruction;
             Context = hostContext;
             Token = cancellationToken;

@@ -16,6 +16,14 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
 {
     private readonly IDataProtector protector = protection.CreateProtector("RGF.Recroby.ConversationIdentity.v1");
 
+    /// <summary>Returns public data from the existing AI catalog.</summary>
+    public RgfAiCatalogResponse GetCatalog() => routes is null
+        ? new(string.Empty, [])
+        : new(routes.Catalog.DefaultProvider, routes.Catalog.Providers.Select(provider =>
+            new RgfAiProviderCatalogItem(provider.Id, provider.DefaultModel, provider.Models.Select(model =>
+                new RgfAiModelCatalogItem(model.Id, model.Modes.Select(mode => mode.ToString()).ToArray(),
+                    model.Efforts, model.DefaultMode?.ToString(), model.DefaultEffort)).ToArray())).ToArray());
+
     public Task<RgfAiResponse> ExecuteAsync(string userId, RgfAiRequest request,
         CancellationToken cancellationToken = default)
         => ExecuteAsync(userId, request, null, cancellationToken);
@@ -70,7 +78,8 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
             ArgumentNullException.ThrowIfNull(execution.InputData);
             if (identity is not null && identity.WorkflowId != execution.WorkflowId)
                 throw new UnauthorizedAccessException("A conversation cannot be continued with another workflow.");
-            executionOptions = routes is { HasConfiguredProvider: false } ? null : ResolveModel(modelOverride);
+            executionOptions = routes is { HasConfiguredProvider: false } ? null
+                : ResolveModel(modelOverride, request.AiReasoningEffortOverride);
         }
 
         if (routes is { HasConfiguredProvider: false })
@@ -138,15 +147,20 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
         }
     }
 
-    private AIExecutionOptions? ResolveModel(string? modelOverride)
+    private AIExecutionOptions? ResolveModel(string? modelOverride, string? effortOverride)
     {
-        if (modelOverride is null) return null;
+        if (modelOverride is null && effortOverride is null) return null;
         if (routes is null)
             throw new InvalidOperationException("Model overrides require the configured Recrovit.AI provider catalog.");
-        var parts = modelOverride.Split('/');
+        var parts = modelOverride?.Split('/');
+        if (parts is null)
+        {
+            var defaultResolved = routes.Resolve(null, routes.DefaultProvider, null, effortOverride);
+            return new AIExecutionOptions { ExecutionRoute = defaultResolved.RouteId, Reasoning = defaultResolved.Reasoning };
+        }
         if (parts.Length > 2 || parts.Any(string.IsNullOrWhiteSpace))
             throw new ArgumentException("Use a model alias or provider/model alias for AiModelOverride.");
-        var resolved = routes.Resolve(null, parts.Length == 2 ? parts[0] : routes.DefaultProvider, parts[^1], null);
+        var resolved = routes.Resolve(null, parts.Length == 2 ? parts[0] : routes.DefaultProvider, parts[^1], effortOverride);
         return new AIExecutionOptions { ExecutionRoute = resolved.RouteId, Reasoning = resolved.Reasoning };
     }
 }

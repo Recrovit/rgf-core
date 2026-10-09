@@ -309,6 +309,11 @@ public sealed class RecrobyTests
         Assert.Empty(fixture.DefaultChat.Messages);
         await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.ExecuteAsync("owner",
             new() { CurrentUserMessage = "bad", AiModelOverride = "missing" }, Token));
+        var defaultRequest = Reply(next, "return to default");
+        defaultRequest.AiModelOverride = "p/default";
+        var defaultResponse = await fixture.Service.ExecuteAsync("owner", defaultRequest, Token);
+        Assert.True(defaultResponse.Success);
+        Assert.Equal("default answer", defaultResponse.Message);
     }
 
     [Fact]
@@ -323,6 +328,24 @@ public sealed class RecrobyTests
         Assert.Equal("alternate answer", next.Message);
         Assert.Equal(first.WorkflowRunId, next.WorkflowRunId);
         Assert.Single(fixture.AlternateChat.Messages);
+        Assert.Empty(fixture.DefaultChat.Messages);
+    }
+
+    [Theory]
+    [InlineData(null, "high")]
+    [InlineData("low", "low")]
+    public async Task PendingRunRetainsOriginalReasoningDespiteContinuationOverride(string? effort, string expected)
+    {
+        await using var fixture = new Fixture(custom: true, aiAfterResume: true, reasoning: true);
+        var first = await fixture.Service.ExecuteAsync("owner", new()
+        { CurrentUserMessage = "first", AiModelOverride = "p/alternate", AiReasoningEffortOverride = effort },
+            new HostContext("owner", 42), Token);
+        var reply = Reply(first, "continue");
+        reply.AiReasoningEffortOverride = "invalid-continuation-effort";
+        var next = await fixture.Service.ExecuteAsync("owner", reply, Token);
+        Assert.True(next.Success);
+        Assert.Equal(first.WorkflowRunId, next.WorkflowRunId);
+        Assert.Equal(expected, Assert.Single(fixture.AlternateChat.Reasoning)!.Effort);
         Assert.Empty(fixture.DefaultChat.Messages);
     }
 
@@ -437,7 +460,7 @@ public sealed class RecrobyTests
         public HostExtension? Extension { get; }
         public OtherExtension? OtherExtension { get; }
         public IDataProtectionProvider Protection { get; } = new EphemeralDataProtectionProvider();
-        public Fixture(bool custom = false, bool aiAfterResume = false, bool multiple = false, bool ambiguous = false)
+        public Fixture(bool custom = false, bool aiAfterResume = false, bool multiple = false, bool ambiguous = false, bool reasoning = false)
         {
             Decision.AiAfterResume = aiAfterResume;
             var services = new ServiceCollection();
@@ -465,7 +488,8 @@ public sealed class RecrobyTests
             services.AddSingleton(new AiRouteCatalog(new AiOptions
             {
                 DefaultProvider = "p", Providers = new() { ["p"] = new()
-                    { DefaultModel = "default", Models = new() { ["default"] = "native-default", ["alternate"] = "native-alternate" } } }
+                    { DefaultModel = "default", Models = new() { ["default"] = "native-default", ["alternate"] = "native-alternate" },
+                        Reasoning = reasoning ? new() { Efforts = ["low", "high"], DefaultEffort = "high" } : null } }
             }));
             services.AddSingleton(Protection);
             if (custom) services.AddRgfRecroby<HostExtension>(); else services.AddRgfRecroby();
@@ -488,6 +512,7 @@ public sealed class RecrobyTests
     {
         public List<ChatMessage[]> Messages { get; } = [];
         public List<string> Invocations { get; } = [];
+        public List<AIReasoningOptions?> Reasoning { get; } = [];
         public Queue<string> DecisionKeys { get; } = new();
         public void Dispose() { }
         public object? GetService(Type type, object? key = null) => type.IsInstanceOfType(this) ? this : null;
@@ -495,6 +520,7 @@ public sealed class RecrobyTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             Messages.Add(messages.ToArray());
+            Reasoning.Add(AIReasoningChatOptions.Get(options));
             var format = Assert.IsType<ChatResponseFormatJson>(options?.ResponseFormat);
             var output = format.Schema!.Value.GetProperty("properties").GetProperty("output");
             if (output.TryGetProperty("properties", out var properties) && properties.TryGetProperty("decisionKey", out var decisionKeySchema))

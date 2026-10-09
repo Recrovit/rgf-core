@@ -12,6 +12,18 @@ namespace Recrovit.RecroGridFramework.Core.AI.Recroby.Http;
 [Route("api/rgf/ai/recroby")]
 public sealed class RgfRecrobyController(RgfRecrobyService recroby, IRgfIdentityService identity) : ControllerBase
 {
+    /// <summary>Returns the public catalog of configured providers and models.</summary>
+    [HttpGet("catalog")]
+    [ProducesResponseType<RgfAiCatalogResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    public async Task<ActionResult<RgfAiCatalogResponse>> GetCatalogAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var userId = await identity.GetUserIdAsync(User);
+        if (string.IsNullOrWhiteSpace(userId)) return Unauthorized();
+        return Ok(recroby.GetCatalog());
+    }
+
     /// <summary>Sends the current user instruction to Recroby.</summary>
     [HttpPost]
     [ProducesResponseType<RgfAiResponse>(StatusCodes.Status200OK)]
