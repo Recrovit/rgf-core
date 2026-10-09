@@ -1,14 +1,19 @@
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Agents.AI;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Recrovit.AI.Core;
+using Recrovit.AI.Core.Conversations;
+using Recrovit.AI.Core.Conversations.History;
 using Recrovit.AI.Core.DependencyInjection;
 using Recrovit.AI.Core.Workflows;
 using Recrovit.AI.Runtime;
 using Recrovit.AI.Runtime.Configuration;
 using Recrovit.RecroGridFramework.Abstraction.Contracts.AI;
+using Recrovit.RecroGridFramework.Abstraction.Contracts.AI.Server;
+using Recrovit.RecroGridFramework.Identity;
 using Recrovit.RecroGridFramework.Core.AI.Recroby;
 using Recrovit.RecroGridFramework.Core.AI.Recroby.Extensions;
 using Recrovit.RecroGridFramework.Core.AI.Recroby.Workflows;
@@ -20,6 +25,166 @@ namespace RGF.Core.Tests;
 
 public sealed class RecrobyTests
 {
+    [Fact]
+    public async Task EveryModelCallChecksCreditOnceInFreshScopeAndOtherGuardsStillRun()
+    {
+        await using var fixture = new Fixture();
+        var response = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "Hello" }, Token);
+        Assert.True(response.Success);
+        Assert.Equal(new[] { "intent", "chat" }, fixture.DefaultChat.Invocations);
+        Assert.Equal(new[] { "owner", "owner" }, fixture.Credit.Users);
+        Assert.Equal(2, fixture.GuardContexts.Count);
+        Assert.NotSame(fixture.Credit.Instances[0], fixture.Credit.Instances[1]);
+        Assert.All(fixture.Credit.Instances, credit => Assert.True(credit.Disposed));
+    }
+
+    [Theory]
+    [InlineData(AiCreditDenialReason.UserDisabled, "Test User", "Test User", false)]
+    [InlineData(AiCreditDenialReason.InsufficientCredit, "Test User", "Test User", false)]
+    [InlineData(AiCreditDenialReason.BalanceExpired, "Test User", "Test User", false)]
+    [InlineData(AiCreditDenialReason.InvalidConfiguration, "Test User", "Test User", false)]
+    [InlineData(AiCreditDenialReason.UserNotFound, "Test User", "Test User", false)]
+    [InlineData(AiCreditDenialReason.InfrastructureFailure, "Test User", "Test User", false)]
+    [InlineData(AiCreditDenialReason.UserDisabled, "  Kovács János  ", "Kovács János", false)]
+    [InlineData(AiCreditDenialReason.UserDisabled, "<script>alert('name')</script>", "<script>alert('name')</script>", false)]
+    [InlineData(AiCreditDenialReason.UserDisabled, null, "this user", false)]
+    [InlineData(AiCreditDenialReason.UserDisabled, " ", "this user", false)]
+    [InlineData(AiCreditDenialReason.UserDisabled, "Name\nInjected", "this user", false)]
+    [InlineData(AiCreditDenialReason.UserDisabled, "Name\u202eInjected", "this user", false)]
+    [InlineData(AiCreditDenialReason.UserDisabled, "NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN", "this user", false)]
+    [InlineData(AiCreditDenialReason.UserDisabled, "Test User", "this user", true)]
+    public async Task SecondModelDenialStopsProviderAndReturnsStructuredCreditFailure(
+        AiCreditDenialReason reason, string? userName, string expectedName, bool failCredentials)
+    {
+        await using var fixture = new Fixture();
+        var identity = (TestIdentityProxy)fixture.Identity;
+        identity.UserName = userName;
+        identity.FailCredentials = failCredentials;
+        fixture.Credit.Decisions.Enqueue(null);
+        fixture.Credit.Decisions.Enqueue(reason);
+        var response = await fixture.Service.ExecuteAsync("owner", new()
+        {
+            CurrentUserMessage = "Hello", CustomParams = new() { ["userName"] = "Spoofed client name" }
+        }, Token);
+        Assert.False(response.Success);
+        Assert.Equal($"AiCredit.{reason}", response.ErrorCode);
+        Assert.NotEmpty(response.Message);
+        if (reason == AiCreditDenialReason.UserDisabled)
+            Assert.Equal($"AI Credit access is disabled for {expectedName}.", response.Message);
+        Assert.DoesNotContain("Spoofed client name", response.Message);
+        Assert.DoesNotContain("private identity detail", response.Message);
+        Assert.Null(response.WorkflowStatus);
+        Assert.Equal("intent", Assert.Single(fixture.DefaultChat.Invocations));
+        Assert.Equal(2, fixture.Credit.Users.Count);
+        var conversation = fixture.GuardContexts[0].ConversationId!;
+        Assert.DoesNotContain(fixture.History.Read(conversation), message => message.Role == ConversationHistoryRole.Assistant);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task MissingHttpOrUserIdentityStopsProvider(bool httpContext, bool anonymous)
+    {
+        await using var fixture = new Fixture();
+        if (!httpContext) fixture.Http.HttpContext = null;
+        else if (anonymous) fixture.Http.HttpContext = new DefaultHttpContext();
+        else ((TestIdentityProxy)fixture.Identity).UserId = " ";
+        var response = await fixture.Service.ExecuteAsync("owner", new()
+        { CurrentUserMessage = "Hello", CustomParams = new() { ["userId"] = "owner" } }, Token);
+        Assert.False(response.Success);
+        Assert.Equal("AiCredit.UserNotFound", response.ErrorCode);
+        Assert.Empty(fixture.Credit.Users);
+        Assert.Empty(fixture.DefaultChat.Invocations);
+    }
+
+    [Fact]
+    public async Task ResumeChecksCreditBeforeItsFirstModelCallAndPreservesConversationIdentityOnDenial()
+    {
+        await using var fixture = new Fixture(custom: true, aiAfterResume: true);
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
+        Assert.True(first.Success);
+        Assert.Empty(fixture.Credit.Users);
+        fixture.Credit.Decisions.Enqueue(AiCreditDenialReason.InsufficientCredit);
+        var denied = await fixture.Service.ExecuteAsync("owner", Reply(first, "continue"), Token);
+        Assert.False(denied.Success);
+        Assert.Equal("AiCredit.InsufficientCredit", denied.ErrorCode);
+        Assert.Equal(first.ConversationId, denied.ConversationId);
+        Assert.Equal(first.ConversationToken, denied.ConversationToken);
+        Assert.Equal(first.WorkflowRunId, denied.WorkflowRunId);
+        Assert.Null(denied.WorkflowStatus);
+        Assert.Equal("owner", Assert.Single(fixture.Credit.Users));
+        Assert.Empty(fixture.DefaultChat.Invocations);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ToolCallingChecksEveryAdditionalModelRequest(bool denySecond)
+    {
+        await using var fixture = new Fixture(custom: true, aiAfterResume: true, toolCalling: true);
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
+        fixture.Credit.Decisions.Enqueue(null);
+        fixture.Credit.Decisions.Enqueue(denySecond ? AiCreditDenialReason.InsufficientCredit : null);
+        var response = await fixture.Service.ExecuteAsync("owner", Reply(first, "continue"), Token);
+        Assert.Equal(!denySecond, response.Success);
+        Assert.Equal(denySecond ? "AiCredit.InsufficientCredit" : null, response.ErrorCode);
+        Assert.Equal(2, fixture.Credit.Users.Count);
+        Assert.Equal(denySecond ? 1 : 2, fixture.DefaultChat.Messages.Count);
+        Assert.Equal(1, fixture.ToolInvocations);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StreamingUsesScopedCreditGuardBeforeProvider(bool deny)
+    {
+        await using var fixture = new Fixture();
+        fixture.Credit.Decisions.Enqueue(deny ? AiCreditDenialReason.UserDisabled : null);
+        async Task Execute()
+        {
+            await foreach (var _ in fixture.Conversations.ExecuteStreamingAsync(null, "Hello", Token)) { }
+        }
+        if (deny)
+        {
+            var exception = await Assert.ThrowsAsync<AIProviderRequestRejectedException>(Execute);
+            Assert.Equal("AiCredit.UserDisabled", exception.ReasonCode);
+        }
+        else await Execute();
+        Assert.Equal(deny ? 0 : 1, fixture.DefaultChat.StreamingCalls);
+        Assert.Single(fixture.Credit.Users);
+        Assert.True(Assert.Single(fixture.Credit.Instances).Disposed);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancellationDuringCreditCheckPropagatesAndStopsProvider(bool streaming)
+    {
+        await using var fixture = new Fixture();
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        fixture.Credit.OnCheck = token =>
+        {
+            cancellation.Cancel();
+            throw new OperationCanceledException(token);
+        };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            if (streaming)
+                await foreach (var _ in fixture.Conversations.ExecuteStreamingAsync(null, "Hello", cancellation.Token)) { }
+            else await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "Hello" }, cancellation.Token);
+        });
+        Assert.Empty(fixture.DefaultChat.Invocations);
+        Assert.Equal(0, fixture.DefaultChat.StreamingCalls);
+    }
+
+    [Fact]
+    public void MissingCreditServiceFailsDependencyValidation()
+    {
+        var exception = Assert.Throws<AggregateException>(() => new Fixture(registerCredit: false));
+        Assert.Contains(nameof(IAiCreditService), exception.ToString());
+    }
+
     [Fact]
     public async Task ExactlyOneMatchingExtensionExecutesDespiteManipulatedCustomParams()
     {
@@ -389,6 +554,7 @@ public sealed class RecrobyTests
 
     private sealed record HostContext(string Owner, int Selection) : RgfRecrobyContext(Owner);
     private sealed record OtherContext(string Owner) : RgfRecrobyContext(Owner);
+    private sealed record ToolValue(string Text);
 
     private class HostExtension(IStructuredContractRegistry contracts) : IRgfRecrobyExtension
     {
@@ -460,15 +626,33 @@ public sealed class RecrobyTests
         public HostExtension? Extension { get; }
         public OtherExtension? OtherExtension { get; }
         public IDataProtectionProvider Protection { get; } = new EphemeralDataProtectionProvider();
-        public Fixture(bool custom = false, bool aiAfterResume = false, bool multiple = false, bool ambiguous = false, bool reasoning = false)
+        public AiCreditTestState Credit { get; } = new();
+        public List<AIProviderRequestContext> GuardContexts { get; } = [];
+        public IHttpContextAccessor Http => provider.GetRequiredService<IHttpContextAccessor>();
+        public IRgfIdentityService Identity => provider.GetRequiredService<IRgfIdentityService>();
+        public IConversationHistoryReader History => provider.GetRequiredService<IConversationHistoryReader>();
+        public IConversationExecutor Conversations => provider.GetRequiredService<IConversationExecutor>();
+        public int ToolInvocations { get; private set; }
+        public Fixture(bool custom = false, bool aiAfterResume = false, bool multiple = false, bool ambiguous = false, bool reasoning = false,
+            bool toolCalling = false, bool registerCredit = true)
         {
             Decision.AiAfterResume = aiAfterResume;
             var services = new ServiceCollection();
             services.AddLogging();
+            Credit.Register(services);
+            services.AddScoped<IAIProviderRequestGuard>(_ => new RecordingGuard(GuardContexts));
+            DefaultChat.CallTool = toolCalling;
             services.AddRecrovitAICore(configuration =>
             {
                 configuration.AddDefaultRecrobyWorkflow();
                 configuration.Contracts.Register<string>("host.input");
+                configuration.Contracts.Register<ToolValue>("host.tool-value");
+                configuration.Tools.Register(new() { Id = "host.tool", InputContractId = "host.tool-value", OutputContractId = "host.tool-value" },
+                    (_, input, _) =>
+                    {
+                        ToolInvocations++;
+                        return ValueTask.FromResult(new ApplicationToolResult { Output = input! });
+                    });
                 configuration.Decisions.Register("host.ask", Decision);
                 configuration.Workflows.Register(new WorkflowDefinition
                 {
@@ -477,6 +661,7 @@ public sealed class RecrobyTests
                         DecisionExecutionMode = DecisionExecutionMode.Application, AllowInputRequest = true },
                         new AgentDefinition { Id = "host.chat", Name = "Chat", Type = AgentType.Executor,
                             Instruction = "Respond", AllowInputRequest = false, OutputContractId = "rgf.recroby.response",
+                            AllowedToolIds = toolCalling ? ["host.tool"] : [],
                             AIExecutionOptions = new() { ExecutionRoute = "p/default" } }],
                     Relations = [new AgentRelation { SourceAgentId = "host.ask", TargetAgentId = "host.chat", DecisionKey = "chat" }]
                 });
@@ -494,8 +679,12 @@ public sealed class RecrobyTests
             services.AddSingleton(Protection);
             if (custom) services.AddRgfRecroby<HostExtension>(); else services.AddRgfRecroby();
             if (multiple) services.AddRgfRecroby<OtherExtension>();
+            if (!registerCredit)
+                for (var i = services.Count - 1; i >= 0; i--)
+                    if (services[i].ServiceType == typeof(IAiCreditService)) services.RemoveAt(i);
             provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
             scope = provider.CreateAsyncScope();
+            AiCreditTestState.Authenticate(provider);
             Service = scope.ServiceProvider.GetRequiredService<RgfRecrobyService>();
             var extensions = scope.ServiceProvider.GetServices<IRgfRecrobyExtension>().ToArray();
             if (custom) Extension = Assert.Single(extensions.OfType<HostExtension>(), candidate => candidate.GetType() == typeof(HostExtension));
@@ -510,6 +699,8 @@ public sealed class RecrobyTests
 
     private sealed class ChatClient(string answer) : IChatClient
     {
+        public bool CallTool { get; set; }
+        public int StreamingCalls { get; private set; }
         public List<ChatMessage[]> Messages { get; } = [];
         public List<string> Invocations { get; } = [];
         public List<AIReasoningOptions?> Reasoning { get; } = [];
@@ -521,6 +712,9 @@ public sealed class RecrobyTests
             cancellationToken.ThrowIfCancellationRequested();
             Messages.Add(messages.ToArray());
             Reasoning.Add(AIReasoningChatOptions.Get(options));
+            if (CallTool && Messages.Count == 1)
+                return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant,
+                    [new FunctionCallContent("call-1", "host_tool", new Dictionary<string, object?> { ["text"] = "input" })])));
             var format = Assert.IsType<ChatResponseFormatJson>(options?.ResponseFormat);
             var output = format.Schema!.Value.GetProperty("properties").GetProperty("output");
             if (output.TryGetProperty("properties", out var properties) && properties.TryGetProperty("decisionKey", out var decisionKeySchema))
@@ -539,7 +733,22 @@ public sealed class RecrobyTests
             return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant,
                 JsonSerializer.Serialize(new { userMessage = response, output = response }))));
         }
-        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
-            => throw new NotSupportedException();
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            StreamingCalls++;
+            yield return new(ChatRole.Assistant, "stream answer");
+            await Task.CompletedTask;
+        }
+    }
+
+    private sealed class RecordingGuard(List<AIProviderRequestContext> contexts) : IAIProviderRequestGuard
+    {
+        public ValueTask BeforeRequestAsync(AIProviderRequestContext context, CancellationToken cancellationToken = default)
+        {
+            contexts.Add(context);
+            return ValueTask.CompletedTask;
+        }
     }
 }

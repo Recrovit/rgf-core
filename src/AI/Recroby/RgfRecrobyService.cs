@@ -111,6 +111,21 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
                     identity?.WorkflowId ?? execution!.WorkflowId, modelOverride)))
             };
         }
+        catch (Exception exception) when (RgfAiCreditRequestGuard.TryGetRejection(exception, out var code, out var message))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            logger.LogWarning("Recroby Credit access was rejected with {ReasonCode} for conversation {ConversationId}.",
+                code, identity?.ConversationId);
+            return new RgfAiResponse
+            {
+                Success = false, ErrorCode = code, Message = message!,
+                ConversationId = identity?.ConversationId ?? string.Empty,
+                WorkflowRunId = identity?.RunId,
+                // The run inspector exposes identity only; no execution status is available on this exception path.
+                WorkflowStatus = null,
+                ConversationToken = request.ConversationToken
+            };
+        }
         catch (Exception exception) when (exception is not OperationCanceledException and not UnauthorizedAccessException)
         {
             logger.LogError(exception, "Recroby workflow execution failed for conversation {ConversationId}.", identity?.ConversationId);
