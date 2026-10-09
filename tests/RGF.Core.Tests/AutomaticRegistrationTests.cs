@@ -9,6 +9,8 @@ using Recrovit.RecroGridFramework.Abstraction.Contracts.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Recrovit.AI.Core.Workflows;
 using Recrovit.AI.Runtime;
+using Recrovit.AI.Core;
+using Recrovit.RecroGridFramework.Abstraction.Contracts.AI.Server;
 using Recrovit.RecroGridFramework.Core.AI.Recroby;
 using Recrovit.RecroGridFramework.Extensions;
 using Xunit;
@@ -31,6 +33,9 @@ public sealed class AutomaticRegistrationTests
         });
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.AddRGF();
+        var credit = new AiCreditTestState();
+        credit.Register(builder.Services);
+        Assert.Equal(enabled ? 1 : 0, builder.Services.Count(d => d.ImplementationType == typeof(RgfAiCreditRequestGuard)));
         await using var app = builder.Build();
         app.MapControllers();
         await app.StartAsync(TestContext.Current.CancellationToken);
@@ -46,6 +51,8 @@ public sealed class AutomaticRegistrationTests
         await using var scope = app.Services.CreateAsyncScope();
         if (enabled)
         {
+            Assert.IsType<TestCreditService>(scope.ServiceProvider.GetRequiredService<IAiCreditService>());
+            Assert.Single(scope.ServiceProvider.GetServices<IAIProviderRequestGuard>().OfType<RgfAiCreditRequestGuard>());
             var response = await scope.ServiceProvider.GetRequiredService<RgfRecrobyService>()
                 .ExecuteAsync("owner", new() { CurrentUserMessage = "Hello" }, TestContext.Current.CancellationToken);
             Assert.False(response.Success);
@@ -80,6 +87,8 @@ public sealed class AutomaticRegistrationTests
         }
         Assert.Single(builder.Services, descriptor => descriptor.ServiceType == typeof(RgfRecrobyService));
         Assert.Single(builder.Services, descriptor => descriptor.ServiceType == typeof(IWorkflowClient));
+        var guard = Assert.Single(builder.Services, descriptor => descriptor.ImplementationType == typeof(RgfAiCreditRequestGuard));
+        Assert.Equal(ServiceLifetime.Scoped, guard.Lifetime);
         using var provider = builder.Services.BuildServiceProvider();
         Assert.Equal("rgf.recroby", provider.GetRequiredService<WorkflowRegistry>().Get("rgf.recroby").Id);
     }

@@ -16,6 +16,8 @@ public static class RgfRecrobyServiceCollectionExtensions
                 Workflows.RgfRecrobyWorkflowConfigurationExtensions.AddDefaultRecrobyWorkflow);
         }
         services.AddDataProtection();
+        services.AddHttpContextAccessor();
+        services.TryAddEnumerable(ServiceDescriptor.Scoped<Recrovit.AI.Core.IAIProviderRequestGuard, RgfAiCreditRequestGuard>());
         var options = services.AddOptions<RgfRecrobyOptions>()
             .Validate(value => !string.IsNullOrWhiteSpace(value.WorkflowId), "A Recroby workflow is required.");
         if (configure is not null) options.Configure(configure);

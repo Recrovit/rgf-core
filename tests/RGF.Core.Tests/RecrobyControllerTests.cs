@@ -20,6 +20,51 @@ namespace RGF.Core.Tests;
 public sealed class RecrobyControllerTests
 {
     [Theory]
+    [InlineData(0, "AiCredit.InsufficientCredit")]
+    [InlineData(1, "AiCredit.InsufficientCredit")]
+    [InlineData(2, "AiCredit.InsufficientCredit")]
+    [InlineData(0, "AiCredit.UserDisabled")]
+    [InlineData(1, "AiCredit.UserDisabled")]
+    [InlineData(2, "AiCredit.UserDisabled")]
+    public async Task CreditRejectionIsRecognizedThroughExceptionWrappersWithoutLeakingDetails(int wrapper, string code)
+    {
+        var fixture = new Fixture();
+        Exception rejection = new AIProviderRequestRejectedException("private database configuration", code);
+        fixture.Workflows.Failure = wrapper switch
+        {
+            1 => new WorkflowException(WorkflowErrorCode.ExecutionFailure, "internal workflow", rejection),
+            2 => new AggregateException(new InvalidOperationException("unrelated"),
+                new WorkflowException(WorkflowErrorCode.ExecutionFailure, "internal workflow", rejection)),
+            _ => rejection
+        };
+        var result = await fixture.Controller.ExecuteAsync(new() { CurrentUserMessage = "Hello" }, Token);
+        var response = Assert.IsType<RgfAiResponse>(Assert.IsType<OkObjectResult>(result.Result).Value);
+        Assert.False(response.Success);
+        Assert.Equal(code, response.ErrorCode);
+        if (code == "AiCredit.UserDisabled")
+            Assert.Equal("AI Credit access is disabled for this user.", response.Message);
+        else Assert.Contains("not enough AI Credit", response.Message);
+        Assert.DoesNotContain("private", response.Message);
+        Assert.Null(response.WorkflowStatus);
+        Assert.Null(response.ConversationToken);
+    }
+
+    [Theory]
+    [InlineData("OtherGuard.InsufficientCredit")]
+    [InlineData("AiCredit.Unknown")]
+    [InlineData(null)]
+    public async Task OtherGuardRejectionsRemainGenericWorkflowFailures(string? code)
+    {
+        var fixture = new Fixture();
+        fixture.Workflows.Failure = new AIProviderRequestRejectedException("private detail", code);
+        var result = await fixture.Controller.ExecuteAsync(new() { CurrentUserMessage = "Hello" }, Token);
+        var response = Assert.IsType<RgfAiResponse>(Assert.IsType<OkObjectResult>(result.Result).Value);
+        Assert.False(response.Success);
+        Assert.Null(response.ErrorCode);
+        Assert.Equal("The AI workflow could not complete the request.", response.Message);
+    }
+
+    [Theory]
     [InlineData(null, null, null)]
     [InlineData("p/model", null, "high")]
     [InlineData("p/model", "low", "low")]
@@ -198,6 +243,7 @@ public sealed class RecrobyControllerTests
 
     private sealed class RecordingWorkflows : IWorkflowClient, IWorkflowRunInspector
     {
+        public Exception? Failure { get; set; }
         public WorkflowStatus Status { get; set; } = WorkflowStatus.Completed;
         public int Calls { get; private set; }
         public string? Instruction { get; private set; }
@@ -214,6 +260,7 @@ public sealed class RecrobyControllerTests
             Instruction = userInstruction;
             Context = hostContext;
             Token = cancellationToken;
+            if (Failure is not null) throw Failure;
             return Task.FromResult(new WorkflowOutput
             { ConversationId = "conversation", RunId = "run", Status = Status, AgentResults = [], Usage = new() { Total = new() }, FinalUserMessage = "workflow answer" });
         }
