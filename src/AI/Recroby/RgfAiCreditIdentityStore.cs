@@ -3,7 +3,7 @@ using Recrovit.AI.Core;
 
 namespace Recrovit.RecroGridFramework.Core.AI.Recroby;
 
-// RGF-DOC: rgf.core.recroby.architecture
+// RGF-DOC: rgf.core.ai-credit.integration
 internal sealed class RgfAiCreditIdentityStore
 {
     private readonly ConditionalWeakTable<AIProviderRequestContext, Identity> identities = new();

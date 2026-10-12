@@ -18,4 +18,6 @@ Official Website: [RecroGrid Framework](https://RecroGridFramework.com)
 
 ## Developer documentation
 
-- [Recroby architecture and integration](docs/architecture/Recroby.md)
+- [Core initialization](docs/core-initialization.md)
+- [Recroby architecture and integration](docs/architecture/recroby.md)
+- [AI Credit integration](docs/ai-credit-integration.md)

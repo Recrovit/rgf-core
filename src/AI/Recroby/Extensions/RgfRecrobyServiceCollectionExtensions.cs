@@ -4,9 +4,18 @@ using Microsoft.Extensions.Options;
 
 namespace Recrovit.RecroGridFramework.Core.AI.Recroby.Extensions;
 
+// RGF-DOC: rgf.core.initialization
+// RGF-DOC: rgf.core.recroby.architecture
+// RGF-DOC: rgf.core.ai-credit.integration
+/// <summary>Registers the Recroby facade, workflow and provider Credit hooks.</summary>
 public static class RgfRecrobyServiceCollectionExtensions
 {
     /// <summary>Registers the Recroby facade and general workflow over the shared AI runtime.</summary>
+    /// <param name="services">The application service collection.</param>
+    /// <param name="configure">Optional compatibility-workflow configuration; repeated callbacks accumulate.</param>
+    /// <returns>The supplied service collection.</returns>
+    /// <remarks>Service and default-workflow registrations avoid duplicates. The host supplies the complete
+    /// AI runtime/client, Identity and Credit services, and HTTP pipeline. WorkflowId must be nonblank.</remarks>
     public static IServiceCollection AddRgfRecroby(this IServiceCollection services, Action<RgfRecrobyOptions>? configure = null)
     {
         if (!services.Any(descriptor => descriptor.ServiceType == typeof(RecrobyRegistration)))
@@ -31,6 +40,12 @@ public static class RgfRecrobyServiceCollectionExtensions
     private sealed class RecrobyRegistration;
 
     /// <summary>Registers an application-specific extension without creating another conversation runtime.</summary>
+    /// <typeparam name="TExtension">The scoped application extension that selects and validates its own turns.</typeparam>
+    /// <param name="services">The application service collection.</param>
+    /// <param name="configure">Optional compatibility-workflow configuration.</param>
+    /// <returns>The supplied service collection.</returns>
+    /// <remarks>Registers each implementation type once; does not remove other selectors.
+    /// Core requires exactly one matching extension per application turn.</remarks>
     public static IServiceCollection AddRgfRecroby<TExtension>(this IServiceCollection services,
         Action<RgfRecrobyOptions>? configure = null) where TExtension : class, IRgfRecrobyExtension
     {

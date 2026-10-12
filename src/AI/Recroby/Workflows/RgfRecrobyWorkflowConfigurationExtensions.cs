@@ -2,9 +2,14 @@ using Recrovit.AI.Core.Workflows;
 
 namespace Recrovit.RecroGridFramework.Core.AI.Recroby.Workflows;
 
+// RGF-DOC: rgf.core.recroby.architecture
+/// <summary>Configures the built-in generic intent workflow.</summary>
 public static class RgfRecrobyWorkflowConfigurationExtensions
 {
-    /// <summary>Optional default intent workflow. Applications can register and select their own workflow instead.</summary>
+    /// <summary>Adds the generic intent workflow unless rgf.recroby is already registered.</summary>
+    /// <param name="configuration">The shared workflow and output-contract registries.</param>
+    /// <remarks>The AI decision selects general chat or an application-not-implemented response.
+    /// Both terminal branches return strings and do not request user input. An existing workflow is preserved.</remarks>
     public static void AddDefaultRecrobyWorkflow(this RecrovitWorkflowConfiguration configuration)
     {
         try

@@ -9,7 +9,7 @@ using Recrovit.RecroGridFramework.Identity;
 
 namespace Recrovit.RecroGridFramework.Core.AI.Recroby;
 
-// RGF-DOC: rgf.core.recroby.architecture
+// RGF-DOC: rgf.core.ai-credit.integration
 /// <summary>Checks the authenticated HTTP user's Credit before each logical provider request.</summary>
 public sealed class RgfAiCreditRequestGuard : IAIProviderRequestGuard
 {
@@ -18,6 +18,11 @@ public sealed class RgfAiCreditRequestGuard : IAIProviderRequestGuard
     private readonly IHttpContextAccessor httpContextAccessor;
     private readonly RgfAiCreditIdentityStore identities;
 
+    /// <summary>Creates a scoped Credit guard using the shared identity association store.</summary>
+    /// <param name="credit">Required access-check service.</param>
+    /// <param name="identity">Resolves the RGF user from the authenticated HTTP principal.</param>
+    /// <param name="httpContextAccessor">Provides the current HTTP principal.</param>
+    /// <param name="services">The scope containing the store registered by AddRgfRecroby.</param>
     public RgfAiCreditRequestGuard(IAiCreditService credit, IRgfIdentityService identity,
         IHttpContextAccessor httpContextAccessor, IServiceProvider services)
         => (this.credit, this.identity, this.httpContextAccessor, this.identities)
@@ -25,6 +30,13 @@ public sealed class RgfAiCreditRequestGuard : IAIProviderRequestGuard
 
     private static readonly ConditionalWeakTable<AIProviderRequestRejectedException, string> RejectionUserNames = new();
 
+    /// <summary>Checks authenticated HTTP Credit access and associates an allowed request with its user.</summary>
+    /// <param name="context">The original provider context later used by usage notification.</param>
+    /// <param name="cancellationToken">Cancellation of the access check.</param>
+    /// <remarks>Missing HTTP identity is rejected without a Credit query. Denials use stable AiCredit codes.
+    /// No credit is reserved or deducted by this hook; custom context cannot substitute for HTTP identity.</remarks>
+    /// <exception cref="AIProviderRequestRejectedException">HTTP identity is missing or the Credit service denies access.</exception>
+    /// <exception cref="InvalidOperationException">The context is already associated with another user.</exception>
     public async ValueTask BeforeRequestAsync(AIProviderRequestContext context, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();

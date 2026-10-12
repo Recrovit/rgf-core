@@ -9,14 +9,25 @@ using System.Text.Json;
 
 namespace Recrovit.RecroGridFramework.Core.AI.Recroby;
 
-/// <summary>Owns authorized conversation turns over the single Recrovit.AI workflow runtime.</summary>
+// RGF-DOC: rgf.core.recroby.architecture
+// RGF-DOC: rgf.core.ai-credit.integration
+/// <summary>Executes protected conversation turns over the shared Recrovit.AI workflow runtime.</summary>
+/// <remarks>Application access checks are the selected extension's responsibility; its default validation hook is a no-op.</remarks>
+/// <param name="workflows">The shared workflow start and resume facade.</param>
+/// <param name="runs">The inspector used to verify pending run identity and retrieve its context.</param>
+/// <param name="protection">Data Protection for user-bound conversation tokens.</param>
+/// <param name="extension">The fallback extension when an extension collection is not supplied.</param>
+/// <param name="logger">The sink for execution failures and safe Credit denial diagnostics.</param>
+/// <param name="routes">Optional catalog for overrides and the configured-provider precheck.</param>
+/// <param name="extensions">Application selectors; exactly one must match each application turn.</param>
 public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunInspector runs, IDataProtectionProvider protection,
     IRgfRecrobyExtension extension, ILogger<RgfRecrobyService> logger, AiRouteCatalog? routes = null,
     IEnumerable<IRgfRecrobyExtension>? extensions = null)
 {
     private readonly IDataProtector protector = protection.CreateProtector("RGF.Recroby.ConversationIdentity.v1");
 
-    /// <summary>Returns public data from the existing AI catalog.</summary>
+    /// <summary>Returns configured provider/model aliases and reasoning capabilities without credentials.</summary>
+    /// <returns>The projected catalog, or an empty catalog when none was supplied.</returns>
     public RgfAiCatalogResponse GetCatalog() => routes is null
         ? new(string.Empty, [])
         : new(routes.Catalog.DefaultProvider, routes.Catalog.Providers.Select(provider =>
@@ -24,12 +35,30 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
                 new RgfAiModelCatalogItem(model.Id, model.Modes.Select(mode => mode.ToString()).ToArray(),
                     model.Efforts, model.DefaultMode?.ToString(), model.DefaultEffort)).ToArray())).ToArray());
 
+    /// <summary>Executes a turn without application invocation context.</summary>
+    /// <param name="userId">Nonblank user ID from the authenticated caller.</param>
+    /// <param name="request">Current instruction and, for later turns, matching conversation ID and protected token.</param>
+    /// <param name="cancellationToken">Cancellation propagated to workflow execution.</param>
+    /// <returns>The mapped workflow response or a handled provider/Credit/execution failure.</returns>
+    /// <remarks>New conversations use the generic workflow. Existing protected application conversations
+    /// still require exactly one matching extension and invoke its validation hook.</remarks>
     public Task<RgfAiResponse> ExecuteAsync(string userId, RgfAiRequest request,
         CancellationToken cancellationToken = default)
         => ExecuteAsync(userId, request, null, cancellationToken);
 
     /// <summary>Executes a turn with trusted server-side context used only to prepare a new run.
     /// A pending continuation always retains the stored run's original host context.</summary>
+    /// <param name="userId">Nonblank user ID from the authenticated caller; Credit independently resolves HTTP identity.</param>
+    /// <param name="request">A nonnull request with a nonblank current instruction and verified identity for later turns.</param>
+    /// <param name="initialHostContext">Trusted application selection context, or null for a new generic conversation.</param>
+    /// <param name="cancellationToken">Cancellation propagated to validation, preparation and workflow calls.</param>
+    /// <returns>A response with protected identity on workflow output; handled failures preserve incoming identity.</returns>
+    /// <remarks>Application validation is invoked before preparation, but implementations must enforce access.
+    /// Pending resume skips preparation and retains execution settings. Validation, preparation and model-resolution
+    /// failures occur before the workflow error handler and can propagate. Cancellation and authorization errors propagate.</remarks>
+    /// <exception cref="UnauthorizedAccessException">Identity is invalid, application selection is ambiguous,
+    /// or a prepared workflow differs from the protected conversation workflow.</exception>
+    /// <exception cref="ArgumentException">Required input is blank or model settings are invalid.</exception>
     public async Task<RgfAiResponse> ExecuteAsync(string userId, RgfAiRequest request,
         IWorkflowHostContext? initialHostContext, CancellationToken cancellationToken = default)
     {
