@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Security.Claims;
@@ -10,9 +11,18 @@ namespace Recrovit.RecroGridFramework.Core.AI.Recroby;
 
 // RGF-DOC: rgf.core.recroby.architecture
 /// <summary>Checks the authenticated HTTP user's Credit before each logical provider request.</summary>
-public sealed class RgfAiCreditRequestGuard(IAiCreditService credit, IRgfIdentityService identity,
-    IHttpContextAccessor httpContextAccessor) : IAIProviderRequestGuard
+public sealed class RgfAiCreditRequestGuard : IAIProviderRequestGuard
 {
+    private readonly IAiCreditService credit;
+    private readonly IRgfIdentityService identity;
+    private readonly IHttpContextAccessor httpContextAccessor;
+    private readonly RgfAiCreditIdentityStore identities;
+
+    public RgfAiCreditRequestGuard(IAiCreditService credit, IRgfIdentityService identity,
+        IHttpContextAccessor httpContextAccessor, IServiceProvider services)
+        => (this.credit, this.identity, this.httpContextAccessor, this.identities)
+            = (credit, identity, httpContextAccessor, services.GetRequiredService<RgfAiCreditIdentityStore>());
+
     private static readonly ConditionalWeakTable<AIProviderRequestRejectedException, string> RejectionUserNames = new();
 
     public async ValueTask BeforeRequestAsync(AIProviderRequestContext context, CancellationToken cancellationToken = default)
@@ -36,6 +46,7 @@ public sealed class RgfAiCreditRequestGuard(IAiCreditService credit, IRgfIdentit
             cancellationToken.ThrowIfCancellationRequested();
             throw Reject(reason, userName);
         }
+        identities.Associate(context, userId);
     }
 
     private string? GetUserName(ClaimsPrincipal principal)

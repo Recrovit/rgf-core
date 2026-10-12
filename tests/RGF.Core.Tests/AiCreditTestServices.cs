@@ -13,6 +13,9 @@ internal sealed class AiCreditTestState
     public List<string> Users { get; } = [];
     public List<TestCreditService> Instances { get; } = [];
     public Action<CancellationToken>? OnCheck { get; set; }
+    public System.Collections.Concurrent.ConcurrentQueue<(string UserId, AiCreditUsage Usage, CancellationToken Token)> Usages { get; } = new();
+    public int UsageCalls => Usages.Count;
+    public Action<CancellationToken>? OnUsage { get; set; }
 
     public void Register(IServiceCollection services)
     {
@@ -21,10 +24,10 @@ internal sealed class AiCreditTestState
         services.AddHttpContextAccessor();
     }
 
-    public static void Authenticate(IServiceProvider provider)
+    public static void Authenticate(IServiceProvider provider, string userId = "owner")
         => provider.GetRequiredService<IHttpContextAccessor>().HttpContext = new DefaultHttpContext
         {
-            User = new ClaimsPrincipal(new ClaimsIdentity([new Claim(ClaimTypes.NameIdentifier, "owner")], "test"))
+            User = new ClaimsPrincipal(new ClaimsIdentity([new Claim(ClaimTypes.NameIdentifier, userId)], "test"))
         };
 }
 
@@ -34,10 +37,13 @@ internal sealed class TestCreditService(AiCreditTestState state) : IAiCreditServ
     public Task<AiCreditAccessResult> CheckAccessAsync(string userId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        state.Users.Add(userId);
-        state.Instances.Add(this);
-        state.OnCheck?.Invoke(cancellationToken);
-        return Task.FromResult(new AiCreditAccessResult(state.Decisions.Count == 0 ? null : state.Decisions.Dequeue()));
+        lock (state)
+        {
+            state.Users.Add(userId);
+            state.Instances.Add(this);
+            state.OnCheck?.Invoke(cancellationToken);
+            return Task.FromResult(new AiCreditAccessResult(state.Decisions.Count == 0 ? null : state.Decisions.Dequeue()));
+        }
     }
     public Task<AiCreditMode> GetCreditModeAsync(string userId, CancellationToken cancellationToken = default)
         => throw new NotSupportedException();
@@ -46,7 +52,11 @@ internal sealed class TestCreditService(AiCreditTestState state) : IAiCreditServ
     public Task<IReadOnlyList<AiPeriodCredit>> GetPeriodCreditsAsync(string userId, CancellationToken cancellationToken = default)
         => throw new NotSupportedException();
     public Task ApplyUsageAsync(string userId, AiCreditUsage usage, CancellationToken cancellationToken = default)
-        => throw new NotSupportedException();
+    {
+        state.Usages.Enqueue((userId, usage, cancellationToken));
+        state.OnUsage?.Invoke(cancellationToken);
+        return Task.CompletedTask;
+    }
     public ValueTask DisposeAsync() { Disposed = true; return ValueTask.CompletedTask; }
 }
 
@@ -56,6 +66,7 @@ public class TestIdentityProxy : DispatchProxy
     public string? UserId { get; set; } = "owner";
     public string? UserName { get; set; } = "Test User";
     public bool FailCredentials { get; set; }
+    public bool UsePrincipalUserId { get; set; }
     public ClaimsPrincipal? Principal { get; private set; }
     protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
     {
@@ -67,6 +78,6 @@ public class TestIdentityProxy : DispatchProxy
         }
         if (targetMethod?.Name != nameof(IRgfIdentityService.GetUserIdAsync)) throw new NotSupportedException();
         Principal = (ClaimsPrincipal)args![0]!;
-        return Task.FromResult(UserId!);
+        return Task.FromResult(UsePrincipalUserId ? ((ClaimsPrincipal)args![0]!).FindFirstValue(ClaimTypes.NameIdentifier)! : UserId!);
     }
 }

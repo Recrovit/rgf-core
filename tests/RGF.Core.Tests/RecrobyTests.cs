@@ -36,6 +36,20 @@ public sealed class RecrobyTests
         Assert.Equal(2, fixture.GuardContexts.Count);
         Assert.NotSame(fixture.Credit.Instances[0], fixture.Credit.Instances[1]);
         Assert.All(fixture.Credit.Instances, credit => Assert.True(credit.Disposed));
+        Assert.Equal(2, fixture.Credit.UsageCalls);
+        Assert.Equal(2, fixture.Credit.Usages.Select(call => call.Usage.RequestId).Distinct().Count());
+        Assert.Equal(2, fixture.UsageContexts.Count);
+        Assert.All(fixture.Credit.Usages, call =>
+        {
+            Assert.Equal("owner", call.UserId);
+            Assert.Equal("p", call.Usage.ProviderId);
+            Assert.Equal("native-model", call.Usage.ModelId);
+            Assert.Equal((11L, 12L, 23L, 4L, 5L), (call.Usage.InputTokens, call.Usage.OutputTokens,
+                call.Usage.TotalTokens, call.Usage.CachedInputTokens, call.Usage.ReasoningTokens));
+            var observed = Assert.Single(fixture.UsageContexts, context => context.RequestId == call.Usage.RequestId);
+            Assert.Equal(observed.ExecutionRoute, call.Usage.ExecutionRoute);
+            Assert.Contains(fixture.GuardContexts, context => ReferenceEquals(context, observed.RequestContext));
+        });
     }
 
     [Theory]
@@ -76,6 +90,7 @@ public sealed class RecrobyTests
         Assert.Null(response.WorkflowStatus);
         Assert.Equal("intent", Assert.Single(fixture.DefaultChat.Invocations));
         Assert.Equal(2, fixture.Credit.Users.Count);
+        Assert.Equal("owner", Assert.Single(fixture.Credit.Usages).UserId);
         var conversation = fixture.GuardContexts[0].ConversationId!;
         Assert.DoesNotContain(fixture.History.Read(conversation), message => message.Role == ConversationHistoryRole.Assistant);
     }
@@ -96,6 +111,7 @@ public sealed class RecrobyTests
         Assert.Equal("AiCredit.UserNotFound", response.ErrorCode);
         Assert.Empty(fixture.Credit.Users);
         Assert.Empty(fixture.DefaultChat.Invocations);
+        Assert.Empty(fixture.Credit.Usages);
     }
 
     [Fact]
@@ -124,6 +140,9 @@ public sealed class RecrobyTests
     {
         await using var fixture = new Fixture(custom: true, aiAfterResume: true, toolCalling: true);
         var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
+        fixture.Http.HttpContext!.User = new System.Security.Claims.ClaimsPrincipal(new System.Security.Claims.ClaimsIdentity(
+            [new System.Security.Claims.Claim(System.Security.Claims.ClaimTypes.NameIdentifier, "authenticated-user")], "test"));
+        ((TestIdentityProxy)fixture.Identity).UsePrincipalUserId = true;
         fixture.Credit.Decisions.Enqueue(null);
         fixture.Credit.Decisions.Enqueue(denySecond ? AiCreditDenialReason.InsufficientCredit : null);
         var response = await fixture.Service.ExecuteAsync("owner", Reply(first, "continue"), Token);
@@ -132,6 +151,8 @@ public sealed class RecrobyTests
         Assert.Equal(2, fixture.Credit.Users.Count);
         Assert.Equal(denySecond ? 1 : 2, fixture.DefaultChat.Messages.Count);
         Assert.Equal(1, fixture.ToolInvocations);
+        Assert.Equal(denySecond ? 1 : 2, fixture.Credit.UsageCalls);
+        Assert.All(fixture.Credit.Usages, call => Assert.Equal("authenticated-user", call.UserId));
     }
 
     [Theory]
@@ -154,6 +175,7 @@ public sealed class RecrobyTests
         Assert.Equal(deny ? 0 : 1, fixture.DefaultChat.StreamingCalls);
         Assert.Single(fixture.Credit.Users);
         Assert.True(Assert.Single(fixture.Credit.Instances).Disposed);
+        Assert.Equal(deny ? 0 : 1, fixture.Credit.UsageCalls);
     }
 
     [Theory]
@@ -183,6 +205,96 @@ public sealed class RecrobyTests
     {
         var exception = Assert.Throws<AggregateException>(() => new Fixture(registerCredit: false));
         Assert.Contains(nameof(IAiCreditService), exception.ToString());
+    }
+
+    [Fact]
+    public async Task ProviderWithoutUsageDoesNotApplyCredit()
+    {
+        await using var fixture = new Fixture();
+        fixture.DefaultChat.Usage = null;
+        Assert.True((await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "Hello" }, Token)).Success);
+        Assert.Empty(fixture.Credit.Usages);
+        Assert.Equal(2, fixture.UsageContexts.Count);
+    }
+
+    [Theory]
+    [InlineData("early")]
+    [InlineData("failure")]
+    [InlineData("cancel")]
+    [InlineData("complete")]
+    public async Task StreamingPreservesKnownUsageAtEveryExit(string exit)
+    {
+        await using var fixture = new Fixture();
+        fixture.DefaultChat.Usage = new() { InputTokenCount = 0, CachedInputTokenCount = 0 };
+        fixture.DefaultChat.StreamFailure = exit switch
+        {
+            "failure" => new InvalidOperationException("provider failure"),
+            "cancel" => new OperationCanceledException(),
+            _ => null
+        };
+        async Task Execute()
+        {
+            await foreach (var update in fixture.Conversations.ExecuteStreamingAsync(null, "Hello", Token))
+                if (exit == "early" && fixture.DefaultChat.StreamingCalls > 0) break;
+        }
+        if (exit == "failure") await Assert.ThrowsAsync<InvalidOperationException>(Execute);
+        else if (exit == "cancel") await Assert.ThrowsAnyAsync<OperationCanceledException>(Execute);
+        else await Execute();
+        var call = Assert.Single(fixture.Credit.Usages);
+        Assert.Equal("owner", call.UserId);
+        Assert.Equal(0, call.Usage.InputTokens);
+        Assert.Equal(0, call.Usage.CachedInputTokens);
+        Assert.Null(call.Usage.OutputTokens);
+        Assert.Null(call.Usage.TotalTokens);
+        Assert.Null(call.Usage.ReasoningTokens);
+        Assert.Equal(exit switch
+        {
+            "early" => AIProviderUsageStatus.Incomplete,
+            "failure" => AIProviderUsageStatus.Failed,
+            "cancel" => AIProviderUsageStatus.Cancelled,
+            _ => AIProviderUsageStatus.Completed
+        }, Assert.Single(fixture.UsageContexts).Status);
+    }
+
+    [Fact]
+    public async Task ConcurrentModelCallsAccountToTheirAuthenticatedHttpUsers()
+    {
+        await using var fixture = new Fixture();
+        ((TestIdentityProxy)fixture.Identity).UsePrincipalUserId = true;
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = 0;
+        fixture.DefaultChat.OnStreamStart = async () =>
+        {
+            if (Interlocked.Increment(ref started) == 2) ready.SetResult();
+            await ready.Task.WaitAsync(Token);
+        };
+        await Task.WhenAll(new[] { "alice", "bob" }.Select(async userId =>
+        {
+            fixture.Authenticate(userId);
+            await foreach (var _ in fixture.Conversations.ExecuteStreamingAsync(null, "Hello", Token)) { }
+        }));
+        Assert.Equal(new[] { "alice", "bob" }, fixture.Credit.Usages.Select(call => call.UserId).Order().ToArray());
+        Assert.Equal(2, fixture.Credit.Usages.Select(call => call.Usage.RequestId).Distinct().Count());
+        Assert.Equal(2, fixture.UsageContexts.Count);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CreditHookFailurePreservesOtherHandlersAndProviderFailure(bool providerFails)
+    {
+        await using var fixture = new Fixture();
+        fixture.Credit.OnUsage = _ => throw new InvalidOperationException("accounting failure");
+        fixture.DefaultChat.StreamFailure = providerFails ? new InvalidOperationException("provider failure") : null;
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await foreach (var _ in fixture.Conversations.ExecuteStreamingAsync(null, "Hello", Token)) { }
+        });
+        Assert.Equal(providerFails ? "provider failure" : "accounting failure", exception.Message);
+        if (providerFails)
+            Assert.Equal("accounting failure", Assert.IsType<InvalidOperationException>(exception.Data["Recrovit.AI.ProviderUsageHandlerFailure"]).Message);
+        Assert.Single(fixture.Credit.Usages);
+        Assert.Single(fixture.UsageContexts);
     }
 
     [Fact]
@@ -628,6 +740,7 @@ public sealed class RecrobyTests
         public IDataProtectionProvider Protection { get; } = new EphemeralDataProtectionProvider();
         public AiCreditTestState Credit { get; } = new();
         public List<AIProviderRequestContext> GuardContexts { get; } = [];
+        public List<AIProviderUsageContext> UsageContexts { get; } = [];
         public IHttpContextAccessor Http => provider.GetRequiredService<IHttpContextAccessor>();
         public IRgfIdentityService Identity => provider.GetRequiredService<IRgfIdentityService>();
         public IConversationHistoryReader History => provider.GetRequiredService<IConversationHistoryReader>();
@@ -677,7 +790,10 @@ public sealed class RecrobyTests
                         Reasoning = reasoning ? new() { Efforts = ["low", "high"], DefaultEffort = "high" } : null } }
             }));
             services.AddSingleton(Protection);
+            services.AddSingleton<IAIProviderIdentityResolver>(provider => provider.GetRequiredService<AiRouteCatalog>());
             if (custom) services.AddRgfRecroby<HostExtension>(); else services.AddRgfRecroby();
+            services.AddRgfRecroby();
+            services.AddScoped<IAIProviderUsageHandler>(_ => new RecordingUsageHandler(UsageContexts));
             if (multiple) services.AddRgfRecroby<OtherExtension>();
             if (!registerCredit)
                 for (var i = services.Count - 1; i >= 0; i--)
@@ -695,12 +811,21 @@ public sealed class RecrobyTests
             }
         }
         public async ValueTask DisposeAsync() { await scope.DisposeAsync(); await provider.DisposeAsync(); }
+        public void Authenticate(string userId) => AiCreditTestState.Authenticate(provider, userId);
     }
 
     private sealed class ChatClient(string answer) : IChatClient
     {
         public bool CallTool { get; set; }
-        public int StreamingCalls { get; private set; }
+        public UsageDetails? Usage { get; set; } = new()
+        {
+            InputTokenCount = 11, OutputTokenCount = 12, TotalTokenCount = 23,
+            CachedInputTokenCount = 4, ReasoningTokenCount = 5
+        };
+        public Exception? StreamFailure { get; set; }
+        public Func<Task>? OnStreamStart { get; set; }
+        private int streamingCalls;
+        public int StreamingCalls => streamingCalls;
         public List<ChatMessage[]> Messages { get; } = [];
         public List<string> Invocations { get; } = [];
         public List<AIReasoningOptions?> Reasoning { get; } = [];
@@ -713,8 +838,8 @@ public sealed class RecrobyTests
             Messages.Add(messages.ToArray());
             Reasoning.Add(AIReasoningChatOptions.Get(options));
             if (CallTool && Messages.Count == 1)
-                return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant,
-                    [new FunctionCallContent("call-1", "host_tool", new Dictionary<string, object?> { ["text"] = "input" })])));
+                return Result(new ChatMessage(ChatRole.Assistant,
+                    [new FunctionCallContent("call-1", "host_tool", new Dictionary<string, object?> { ["text"] = "input" })]));
             var format = Assert.IsType<ChatResponseFormatJson>(options?.ResponseFormat);
             var output = format.Schema!.Value.GetProperty("properties").GetProperty("output");
             if (output.TryGetProperty("properties", out var properties) && properties.TryGetProperty("decisionKey", out var decisionKeySchema))
@@ -723,23 +848,29 @@ public sealed class RecrobyTests
                 var key = DecisionKeys.Count == 0 ? "chat" : DecisionKeys.Dequeue();
                 Assert.Contains($"\"{key}\"", decisionKeySchema.GetRawText());
                 Invocations.Add("intent");
-                return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant,
-                    JsonSerializer.Serialize(new { userMessage = (string?)null, output = new { decisionKey = key } }))));
+                return Result(new ChatMessage(ChatRole.Assistant,
+                    JsonSerializer.Serialize(new { userMessage = (string?)null, output = new { decisionKey = key } })));
             }
             Assert.Contains("string", output.GetProperty("type").EnumerateArray().Select(type => type.GetString()));
             var application = options!.Instructions?.Contains("application-specific request handling is not implemented yet.", StringComparison.Ordinal) == true;
             Invocations.Add(application ? "application" : "chat");
             var response = application ? "Application-specific request handling is not implemented yet." : answer;
-            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant,
-                JsonSerializer.Serialize(new { userMessage = response, output = response }))));
+            return Result(new ChatMessage(ChatRole.Assistant,
+                JsonSerializer.Serialize(new { userMessage = response, output = response })));
         }
+        private Task<ChatResponse> Result(ChatMessage message)
+            => Task.FromResult(new ChatResponse(message) { Usage = Usage, ModelId = "native-model" });
         public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            StreamingCalls++;
-            yield return new(ChatRole.Assistant, "stream answer");
+            Interlocked.Increment(ref streamingCalls);
+            if (OnStreamStart is not null) await OnStreamStart();
+            var update = new ChatResponseUpdate(ChatRole.Assistant, "stream answer") { ModelId = "native-model" };
+            if (Usage is not null) update.Contents.Add(new UsageContent(Usage));
+            yield return update;
             await Task.CompletedTask;
+            if (StreamFailure is not null) throw StreamFailure;
         }
     }
 
@@ -747,7 +878,16 @@ public sealed class RecrobyTests
     {
         public ValueTask BeforeRequestAsync(AIProviderRequestContext context, CancellationToken cancellationToken = default)
         {
-            contexts.Add(context);
+            lock (contexts) contexts.Add(context);
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class RecordingUsageHandler(List<AIProviderUsageContext> contexts) : IAIProviderUsageHandler
+    {
+        public ValueTask OnUsageAsync(AIProviderUsageContext context, CancellationToken cancellationToken = default)
+        {
+            lock (contexts) contexts.Add(context);
             return ValueTask.CompletedTask;
         }
     }
