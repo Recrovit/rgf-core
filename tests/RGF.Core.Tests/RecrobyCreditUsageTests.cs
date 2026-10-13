@@ -25,6 +25,52 @@ public sealed class RecrobyCreditUsageTests
 {
     private static CancellationToken Token => TestContext.Current.CancellationToken;
 
+    [Fact]
+    public async Task EffortSnapshotPreservesEachSendInsteadOfInferringDefaults()
+    {
+        await using var fixture = new Fixture();
+        var first = await fixture.Service.ExecuteAsync(fixture.UserId, new()
+            { CurrentUserMessage = "hello", AiReasoningEffortOverride = "high" }, Token);
+        var second = await fixture.Service.ExecuteAsync(fixture.UserId, new()
+            { CurrentUserMessage = "next", AiReasoningEffortOverride = "low" }, Token);
+        var defaultEffort = await fixture.Execute();
+        Assert.Equal("high", first.CreditUsage!.ReasoningEffort);
+        Assert.Equal("low", second.CreditUsage!.ReasoningEffort);
+        Assert.Null(defaultEffort.CreditUsage!.ReasoningEffort);
+    }
+
+    [Fact]
+    public async Task SameNativeModelAliasesKeepSeparateChargesAndDisplayIdentities()
+    {
+        await using var fixture = new Fixture();
+        fixture.Credit.Settlement = usage => new(usage.RequestId, usage.ModelId == "m" ? 2m : 5m, true);
+        fixture.Workflow.Execute = async _ =>
+        {
+            await fixture.Call("first", "p", "m", new(1, 1));
+            await fixture.Call("second", "p", "other", new(1, 1));
+        };
+        var response = await fixture.Execute();
+        Assert.Equal(7m, response.CreditUsage!.ChargedCredit);
+        Assert.Equal(2, response.CreditUsage.LlmCallCount);
+        Assert.Equal(2m, Assert.Single(response.CreditUsage.Models, model => model.ModelId == "m").ChargedCredit);
+        Assert.Equal(5m, Assert.Single(response.CreditUsage.Models, model => model.ModelId == "other").ChargedCredit);
+        Assert.Equal(fixture.Credit.Usages.Select(value => (value.Usage.ProviderId, value.Usage.ModelId)).Order(),
+            response.CreditUsage.Models.Select(model => (model.ProviderId, model.ModelId)).Order());
+    }
+
+    [Fact]
+    public async Task UnknownAliasPreservesCallCountAndPreventsAccounting()
+    {
+        await using var fixture = new Fixture();
+        fixture.Workflow.Execute = _ => fixture.Call("unknown", "p", "unknown", new(1, 1));
+        var response = await fixture.Execute();
+        Assert.Equal("AiCredit.InvalidConfiguration", response.ErrorCode);
+        Assert.Equal(1, response.CreditUsage!.LlmCallCount);
+        Assert.Null(response.CreditUsage.ChargedCredit);
+        Assert.Empty(response.CreditUsage.Models);
+        Assert.Empty(fixture.Credit.Usages);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -34,19 +80,20 @@ public sealed class RecrobyCreditUsageTests
         fixture.Credit.Charge = 0.125m;
         fixture.Workflow.Execute = async _ =>
         {
-            await fixture.Call("one", "provider-A", "native-A", new(11, 12, 23, 0, 5));
-            await fixture.Call("two", "provider-A", "native-A", new(0, null, null, 4, null));
-            await fixture.Call("three", "provider-B", "native-B", new(7, 8, 15, 0, 0));
+            await fixture.Call("one", "provider-A", "alias-A", new(11, 12, 23, 0, 5));
+            await fixture.Call("two", "provider-A", "alias-A", new(0, null, null, 4, null));
+            await fixture.Call("three", "provider-B", "alias-B", new(7, 8, 15, 0, 0));
         };
         var response = await fixture.Execute();
         Assert.True(response.Success);
         Assert.Null(response.Usage);
         var usage = Assert.IsType<RgfAiCreditUsage>(response.CreditUsage);
         Assert.Equal(0.375m, usage.ChargedCredit);
+        Assert.Equal(3, usage.LlmCallCount);
         Assert.True(usage.ExecutionTime >= TimeSpan.Zero);
         Assert.Equal(2, usage.Models.Count);
         var first = Assert.Single(usage.Models, model => model.ProviderId == "provider-A");
-        Assert.Equal("native-A", first.ModelId);
+        Assert.Equal("alias-A", first.ModelId);
         Assert.Equal(0.25m, first.ChargedCredit);
         using var json = JsonDocument.Parse(JsonSerializer.Serialize(response, new JsonSerializerOptions(JsonSerializerDefaults.Web)));
         var jsonUsage = json.RootElement.GetProperty("creditUsage");
@@ -82,6 +129,7 @@ public sealed class RecrobyCreditUsageTests
         };
         var response = await fixture.Execute();
         Assert.Equal(3, fixture.Credit.UsageCalls);
+        Assert.Equal(2, response.CreditUsage!.LlmCallCount);
         Assert.Equal(3m, response.CreditUsage!.ChargedCredit);
         Assert.Equal(2, response.CreditUsage.Tokens!.InputTokens);
         Assert.Equal(3m, Assert.Single(response.CreditUsage.Models).ChargedCredit);
@@ -126,6 +174,7 @@ public sealed class RecrobyCreditUsageTests
         Assert.Equal(2m, second.CreditUsage!.ChargedCredit);
         Assert.Equal(first.ConversationId, second.ConversationId);
         Assert.Equal(3, fixture.Credit.UsageCalls);
+        Assert.Equal(1, second.CreditUsage!.LlmCallCount);
         await fixture.Call("outside", "p", "m", new(3));
         Assert.Equal(4, fixture.Credit.UsageCalls);
         Assert.Equal(2m, second.CreditUsage.ChargedCredit);
@@ -300,14 +349,14 @@ public sealed class RecrobyCreditUsageTests
             var context = await fixture.Authorize();
             Task notification;
             using (ExecutionContext.SuppressFlow())
-                notification = Task.Run(() => fixture.Notify("independent-scope", context, null, null, new(0)), Token);
+                notification = Task.Run(() => fixture.Notify("independent-scope", context, "p", "m", new(0)), Token);
             await notification;
         };
         var response = await fixture.Execute();
         Assert.Equal(3m, response.CreditUsage!.ChargedCredit);
         var model = Assert.Single(response.CreditUsage.Models);
-        Assert.Null(model.ProviderId);
-        Assert.Null(model.ModelId);
+        Assert.Equal("p", model.ProviderId);
+        Assert.Equal("m", model.ModelId);
     }
 
     [Theory]
@@ -413,7 +462,16 @@ public sealed class RecrobyCreditUsageTests
             services.AddSingleton<IDataProtectionProvider>(new EphemeralDataProtectionProvider());
             services.AddSingleton<IWorkflowClient>(Workflow);
             services.AddSingleton<IWorkflowRunInspector>(Workflow);
-            if (providerMissing) services.AddSingleton(new Recrovit.AI.Runtime.AiRouteCatalog(new()));
+            services.AddSingleton(new Recrovit.AI.Runtime.AiRouteCatalog(providerMissing ? new() : new Recrovit.AI.Runtime.Configuration.AiOptions
+            {
+                DefaultProvider = "p", Providers = new()
+                {
+                    ["p"] = new() { DefaultModel = "m", Models = new() { ["m"] = "native", ["other"] = "native" },
+                        Reasoning = new() { Efforts = ["low", "high"], DefaultEffort = "high" } },
+                    ["provider-A"] = new() { DefaultModel = "alias-A", Models = new() { ["alias-A"] = "native-A" } },
+                    ["provider-B"] = new() { DefaultModel = "alias-B", Models = new() { ["alias-B"] = "native-B" } }
+                }
+            }));
             provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
             scope = provider.CreateAsyncScope();
             Identity = (TestIdentityProxy)provider.GetRequiredService<IRgfIdentityService>();
@@ -452,7 +510,7 @@ public sealed class RecrobyCreditUsageTests
         {
             await using var usageScope = provider.CreateAsyncScope();
             await Assert.Single(usageScope.ServiceProvider.GetServices<IAIProviderUsageHandler>().OfType<RgfAiCreditUsageHandler>())
-                .OnUsageAsync(new(id, request, "unaltered-route", modelId, usage, AIProviderUsageStatus.Completed, providerId), Token);
+                .OnUsageAsync(new(id, request, Recrovit.AI.Runtime.AiRouteCatalog.CreateRouteId(providerId!, modelId!), "native-returned-model", usage, AIProviderUsageStatus.Completed, providerId), Token);
         }
 
         public async ValueTask DisposeAsync()

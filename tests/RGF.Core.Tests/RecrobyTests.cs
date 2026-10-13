@@ -33,6 +33,7 @@ public sealed class RecrobyTests
         var response = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "Hello" }, Token);
         Assert.True(response.Success);
         Assert.Equal(1m, response.CreditUsage!.ChargedCredit);
+        Assert.Equal(2, response.CreditUsage.LlmCallCount);
         Assert.Equal(1m, Assert.Single(response.CreditUsage.Models).ChargedCredit);
         Assert.Equal(new[] { "intent", "chat" }, fixture.DefaultChat.Invocations);
         Assert.Equal(new[] { "owner", "owner" }, fixture.Credit.Users);
@@ -46,10 +47,12 @@ public sealed class RecrobyTests
         {
             Assert.Equal("owner", call.UserId);
             Assert.Equal("p", call.Usage.ProviderId);
-            Assert.Equal("native-model", call.Usage.ModelId);
+            Assert.Equal("default", call.Usage.ModelId);
             Assert.Equal((11L, 12L, 23L, 4L, 5L), (call.Usage.InputTokens, call.Usage.OutputTokens,
                 call.Usage.TotalTokens, call.Usage.CachedInputTokens, call.Usage.ReasoningTokens));
             var observed = Assert.Single(fixture.UsageContexts, context => context.RequestId == call.Usage.RequestId);
+            Assert.Equal("native-model", observed.ModelId);
+            Assert.Equal(call.Usage.ModelId, Assert.Single(response.CreditUsage.Models).ModelId);
             Assert.Equal(observed.ExecutionRoute, call.Usage.ExecutionRoute);
             Assert.Contains(fixture.GuardContexts, context => ReferenceEquals(context, observed.RequestContext));
         });

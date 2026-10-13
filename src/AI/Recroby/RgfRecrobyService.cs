@@ -129,6 +129,7 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
         }
         response.Usage = null;
         response.CreditUsage = collector.Complete(discloseTokens);
+        response.CreditUsage.ReasoningEffort = request.AiReasoningEffortOverride;
         return response;
     }
 

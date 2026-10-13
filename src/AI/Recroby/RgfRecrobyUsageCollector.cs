@@ -13,10 +13,17 @@ internal sealed class RgfRecrobyUsageCollector : IDisposable
     private readonly object gate = new();
     private readonly Dictionary<string, (AiCreditUsage Usage, AiCreditUsageResult Result)> settlements = new(StringComparer.Ordinal);
     private readonly HashSet<string> unknownRequests = new(StringComparer.Ordinal);
+    private readonly HashSet<string> calls = new(StringComparer.Ordinal);
     private bool closed;
 
     public RgfRecrobyUsageCollector() => CurrentSlot.Value = this;
     public static RgfRecrobyUsageCollector? Current => CurrentSlot.Value;
+
+    public void ObserveCall(string requestId)
+    {
+        lock (gate)
+            if (!closed) calls.Add(requestId);
+    }
 
     public void MarkUnknown(string requestId)
     {
@@ -49,6 +56,7 @@ internal sealed class RgfRecrobyUsageCollector : IDisposable
             return new RgfAiCreditUsage
             {
                 ExecutionTime = stopwatch.Elapsed,
+                LlmCallCount = calls.Count,
                 ChargedCredit = unknownRequests.Count == 0 ? values.Sum(value => value.Result.ChargedCredit) : null,
                 Models = values.GroupBy(value => (value.Usage.ProviderId, value.Usage.ModelId)).Select(group =>
                     new RgfAiModelCreditUsage
@@ -91,6 +99,7 @@ internal sealed class RgfRecrobyUsageCollector : IDisposable
             closed = true;
             settlements.Clear();
             unknownRequests.Clear();
+            calls.Clear();
             stopwatch.Stop();
         }
         CurrentSlot.Value = previous;

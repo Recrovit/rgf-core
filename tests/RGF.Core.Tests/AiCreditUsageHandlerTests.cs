@@ -11,6 +11,41 @@ namespace RGF.Core.Tests;
 public sealed class AiCreditUsageHandlerTests
 {
     [Theory]
+    [InlineData(null, "provider-alias")]
+    [InlineData("provider-alias/unknown", "provider-alias")]
+    [InlineData("provider-alias/model-alias", null)]
+    [InlineData("provider-alias/model-alias", "unknown")]
+    [InlineData("unknown/model-alias", "provider-alias")]
+    public async Task UnresolvedAliasNeverSettlesNativeModel(string? route, string? providerId)
+    {
+        var state = new AiCreditTestState();
+        await using var provider = CreateProvider(state);
+        AiCreditTestState.Authenticate(provider);
+        var request = new AIProviderRequestContext();
+        await Authorize(provider, request);
+        await using var scope = provider.CreateAsyncScope();
+        await Assert.ThrowsAsync<Recrovit.RecroGridFramework.AI.AiCreditConfigurationException>(async () =>
+            await Handler(scope.ServiceProvider).OnUsageAsync(new("request", request, route, "actual-model",
+                new(1, 1), AIProviderUsageStatus.Completed, providerId), Token));
+        Assert.Empty(state.Usages);
+    }
+
+    [Fact]
+    public async Task AliasesForSameNativeModelRemainDistinctInAccounting()
+    {
+        var state = new AiCreditTestState();
+        await using var provider = CreateProvider(state);
+        AiCreditTestState.Authenticate(provider);
+        var request = new AIProviderRequestContext();
+        await Authorize(provider, request);
+        await using var scope = provider.CreateAsyncScope();
+        foreach (var alias in new[] { "model-alias", "second-alias" })
+            await Handler(scope.ServiceProvider).OnUsageAsync(new(alias, request, $"provider-alias/{alias}",
+                "actual-model", new(1, 1), AIProviderUsageStatus.Completed, "provider-alias"), Token);
+        Assert.Equal(new[] { "model-alias", "second-alias" }, state.Usages.Select(value => value.Usage.ModelId).Order());
+    }
+
+    [Theory]
     [InlineData(AIProviderUsageStatus.Completed)]
     [InlineData(AIProviderUsageStatus.Failed)]
     [InlineData(AIProviderUsageStatus.Cancelled)]
@@ -24,12 +59,12 @@ public sealed class AiCreditUsageHandlerTests
         await Authorize(provider, request);
         ((TestIdentityProxy)provider.GetRequiredService<IRgfIdentityService>()).UserId = "another-user";
         await using var scope = provider.CreateAsyncScope();
-        var usage = new AIProviderUsageContext("request", request, "route/not-a-provider", "actual-model",
+        var usage = new AIProviderUsageContext("request", request, "provider-alias/model-alias", "actual-model",
             new(11, 12, 23, 4, 5), status, "provider-alias");
         await Handler(scope.ServiceProvider).OnUsageAsync(usage, Token);
         var recorded = Assert.Single(state.Usages);
         Assert.Equal("owner", recorded.UserId);
-        Assert.Equal(new AiCreditUsage("request", "provider-alias", "actual-model", "route/not-a-provider", 11, 12, 23, 4, 5), recorded.Usage);
+        Assert.Equal(new AiCreditUsage("request", "provider-alias", "model-alias", "provider-alias/model-alias", 11, 12, 23, 4, 5), recorded.Usage);
         Assert.Equal(Token, recorded.Token);
     }
 
@@ -52,9 +87,9 @@ public sealed class AiCreditUsageHandlerTests
         var request = new AIProviderRequestContext();
         await Authorize(provider, request);
         await using var scope = provider.CreateAsyncScope();
-        await Handler(scope.ServiceProvider).OnUsageAsync(new("request", request, "provider/model", null,
-            new(0, null, null, 0, null), AIProviderUsageStatus.Incomplete), Token);
-        Assert.Equal(new AiCreditUsage("request", null, null, "provider/model", 0, null, null, 0, null), Assert.Single(state.Usages).Usage);
+        await Handler(scope.ServiceProvider).OnUsageAsync(new("request", request, "provider-alias/model-alias", null,
+            new(0, null, null, 0, null), AIProviderUsageStatus.Incomplete, "provider-alias"), Token);
+        Assert.Equal(new AiCreditUsage("request", "provider-alias", "model-alias", "provider-alias/model-alias", 0, null, null, 0, null), Assert.Single(state.Usages).Usage);
     }
 
     [Fact]
@@ -67,7 +102,7 @@ public sealed class AiCreditUsageHandlerTests
         await Authorize(provider, request);
         await Authorize(provider, request);
         await using var scope = provider.CreateAsyncScope();
-        var usage = new AIProviderUsageContext("request", request, null, null, new(1), AIProviderUsageStatus.Completed);
+        var usage = new AIProviderUsageContext("request", request, "provider-alias/model-alias", null, new(1), AIProviderUsageStatus.Completed, "provider-alias");
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
             await Handler(scope.ServiceProvider).OnUsageAsync(usage with { RequestContext = request with { } }, Token));
         ((TestIdentityProxy)provider.GetRequiredService<IRgfIdentityService>()).UserId = "other";
@@ -87,7 +122,7 @@ public sealed class AiCreditUsageHandlerTests
         await Assert.ThrowsAsync<AIProviderRequestRejectedException>(() => Authorize(provider, request));
         await using var scope = provider.CreateAsyncScope();
         await Assert.ThrowsAsync<InvalidOperationException>(async () => await Handler(scope.ServiceProvider)
-            .OnUsageAsync(new("request", request, null, null, new(1), AIProviderUsageStatus.Completed), Token));
+            .OnUsageAsync(new("request", request, "provider-alias/model-alias", null, new(1), AIProviderUsageStatus.Completed, "provider-alias"), Token));
         Assert.Empty(state.Usages);
     }
 
@@ -107,8 +142,8 @@ public sealed class AiCreditUsageHandlerTests
             if (Interlocked.Increment(ref count) == 20) ready.SetResult();
             await ready.Task;
             await using var scope = provider.CreateAsyncScope();
-            await Handler(scope.ServiceProvider).OnUsageAsync(new($"request-{index}", request, null, null,
-                new(index), AIProviderUsageStatus.Completed), Token);
+            await Handler(scope.ServiceProvider).OnUsageAsync(new($"request-{index}", request, "provider-alias/model-alias", null,
+                new(index), AIProviderUsageStatus.Completed, "provider-alias"), Token);
         }));
         Assert.Equal(20, state.UsageCalls);
         Assert.All(state.Usages, usage => Assert.Equal($"user-{usage.Usage.InputTokens}", usage.UserId));
@@ -127,7 +162,7 @@ public sealed class AiCreditUsageHandlerTests
         Assert.Same(Handler(first.ServiceProvider), Handler(first.ServiceProvider));
         Assert.NotSame(Handler(first.ServiceProvider), Handler(second.ServiceProvider));
         await Assert.ThrowsAsync<InvalidOperationException>(async () => await Handler(first.ServiceProvider)
-            .OnUsageAsync(new("request", request, null, null, new(1), AIProviderUsageStatus.Completed), Token));
+            .OnUsageAsync(new("request", request, "provider-alias/model-alias", null, new(1), AIProviderUsageStatus.Completed, "provider-alias"), Token));
         Assert.Equal(1, state.UsageCalls);
     }
 
@@ -144,6 +179,11 @@ public sealed class AiCreditUsageHandlerTests
     {
         var services = new ServiceCollection();
         services.AddLogging();
+        services.AddSingleton(new Recrovit.AI.Runtime.AiRouteCatalog(new Recrovit.AI.Runtime.Configuration.AiOptions
+        {
+            DefaultProvider = "provider-alias", Providers = new() { ["provider-alias"] = new()
+                { DefaultModel = "model-alias", Models = new() { ["model-alias"] = "actual-model", ["second-alias"] = "actual-model" } } }
+        }));
         state.Register(services);
         services.AddRgfRecroby();
         services.AddRgfRecroby();
