@@ -1,4 +1,5 @@
 using System.Reflection;
+using Recrovit.RecroGridFramework.AI;
 using System.Text.Json;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Http;
@@ -167,6 +168,9 @@ public sealed class RecrobyCreditUsageTests
     [InlineData("missing")]
     [InlineData("failure")]
     [InlineData("settlement-cancellation")]
+    [InlineData("configuration")]
+    [InlineData("wrapped-configuration")]
+    [InlineData("aggregate-configuration")]
     public async Task UnsettledUsageIsUnknownAndRetainsPreviouslyFinalizedModelCharges(string outcome)
     {
         await using var fixture = new Fixture();
@@ -178,6 +182,12 @@ public sealed class RecrobyCreditUsageTests
             {
                 "failure" => _ => throw new InvalidOperationException("settlement failed"),
                 "settlement-cancellation" => _ => throw new OperationCanceledException(),
+                "configuration" => _ => throw new AiCreditConfigurationException("private provider/model detail"),
+                "wrapped-configuration" => _ => throw new System.Reflection.TargetInvocationException(
+                    new AiCreditConfigurationException("private provider/model detail")),
+                "aggregate-configuration" => _ => throw new System.Reflection.TargetInvocationException(
+                    new AggregateException(new InvalidOperationException("other failure"),
+                        new AiCreditConfigurationException("private provider/model detail"))),
                 _ => null
             };
             await fixture.Call("unknown", "p", "m", outcome == "missing" ? null : new(9));
@@ -189,6 +199,14 @@ public sealed class RecrobyCreditUsageTests
             var response = await fixture.Execute();
             Assert.Null(response.CreditUsage!.ChargedCredit);
             Assert.Equal(2m, Assert.Single(response.CreditUsage.Models).ChargedCredit);
+            if (outcome.Contains("configuration", StringComparison.Ordinal))
+            {
+                Assert.False(response.Success);
+                Assert.Equal("AiCredit.InvalidConfiguration", response.ErrorCode);
+                Assert.Equal("Failed", response.WorkflowStatus);
+                Assert.Equal("Recroby could not complete the request due to a configuration error. Please contact your system administrator.", response.Message);
+                Assert.DoesNotContain("private", response.Message);
+            }
         }
         fixture.Credit.OnUsage = null;
         fixture.Workflow.Execute = _ => fixture.Call("after", "p", "m", new(1));

@@ -28,6 +28,8 @@ public sealed class AiCreditRequestGuardTests
         var exception = await Assert.ThrowsAsync<AIProviderRequestRejectedException>(async () =>
             await Guard(scope.ServiceProvider).BeforeRequestAsync(new(HostContext: new RgfRecrobyContext("attacker")), Token));
         Assert.Equal($"AiCredit.{reason}", exception.ReasonCode);
+        if (reason == AiCreditDenialReason.InvalidConfiguration)
+            Assert.Equal("Recroby could not complete the request due to a configuration error. Please contact your system administrator.", exception.Message);
         Assert.Equal("owner", Assert.Single(state.Users));
         Assert.Same(provider.GetRequiredService<IHttpContextAccessor>().HttpContext!.User,
             ((TestIdentityProxy)provider.GetRequiredService<IRgfIdentityService>()).Principal);

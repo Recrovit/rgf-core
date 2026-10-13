@@ -119,6 +119,6 @@ public sealed class RgfAiCreditRequestGuard : IAIProviderRequestGuard
         AiCreditDenialReason.BalanceExpired => "The AI Credit balance has expired.",
         AiCreditDenialReason.UserNotFound => "An authenticated RGF user is required for AI Credit access.",
         AiCreditDenialReason.InfrastructureFailure => "AI Credit access could not be verified. Please try again later.",
-        _ => "AI Credit is not configured correctly for this user."
+        _ => "Recroby could not complete the request due to a configuration error. Please contact your system administrator."
     };
 }

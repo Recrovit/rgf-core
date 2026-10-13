@@ -5,6 +5,7 @@ using Recrovit.AI.Core.Workflows;
 using Recrovit.AI.Runtime;
 using Recrovit.RecroGridFramework.Abstraction.Contracts.AI;
 using Recrovit.RecroGridFramework.Abstraction.Contracts.AI.Server;
+using Recrovit.RecroGridFramework.AI;
 using Recrovit.RecroGridFramework.Core.AI.Recroby.Extensions;
 using Recrovit.RecroGridFramework.Identity;
 using Recrovit.RecroGridFramework.Security;
@@ -227,6 +228,20 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
                 ConversationToken = request.ConversationToken
             };
         }
+        catch (Exception exception) when (exception is not OperationCanceledException and not UnauthorizedAccessException
+            && HasCreditConfigurationFailure(exception))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            logger.LogError(exception, "Recroby Credit configuration failed for conversation {ConversationId}.", identity?.ConversationId);
+            return new RgfAiResponse
+            {
+                Success = false, ErrorCode = "AiCredit.InvalidConfiguration",
+                Message = "Recroby could not complete the request due to a configuration error. Please contact your system administrator.",
+                ConversationId = identity?.ConversationId ?? string.Empty,
+                WorkflowRunId = identity?.RunId, WorkflowStatus = WorkflowStatus.Failed.ToString(),
+                ConversationToken = request.ConversationToken
+            };
+        }
         catch (Exception exception) when (exception is not OperationCanceledException and not UnauthorizedAccessException)
         {
             logger.LogError(exception, "Recroby workflow execution failed for conversation {ConversationId}.", identity?.ConversationId);
@@ -238,6 +253,22 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
                 ConversationToken = request.ConversationToken
             };
         }
+    }
+
+    private static bool HasCreditConfigurationFailure(Exception exception)
+    {
+        var pending = new Stack<Exception>();
+        var visited = new HashSet<Exception>(ReferenceEqualityComparer.Instance);
+        pending.Push(exception);
+        while (pending.TryPop(out var current))
+        {
+            if (!visited.Add(current)) continue;
+            if (current is AiCreditConfigurationException) return true;
+            if (current.InnerException is { } inner) pending.Push(inner);
+            if (current is AggregateException aggregate)
+                foreach (var nested in aggregate.InnerExceptions) pending.Push(nested);
+        }
+        return false;
     }
 
     private RgfRecrobyConversationIdentity? ReadIdentity(string userId, RgfAiRequest request)
