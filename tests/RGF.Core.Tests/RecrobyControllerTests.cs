@@ -211,7 +211,8 @@ public sealed class RecrobyControllerTests
             var identity = DispatchProxy.Create<IRgfIdentityService, IdentityProxy>();
             Identity = (IdentityProxy)identity;
             var service = new RgfRecrobyService(Workflows, Workflows, Protection, Extension,
-                NullLogger<RgfRecrobyService>.Instance,
+                NullLogger<RgfRecrobyService>.Instance, new TestCreditService(new()), identity,
+                new HttpContextAccessor { HttpContext = new DefaultHttpContext { User = User } },
                 providerMissing ? new Recrovit.AI.Runtime.AiRouteCatalog(new()) : configured
                     ? new Recrovit.AI.Runtime.AiRouteCatalog(new()
                     {

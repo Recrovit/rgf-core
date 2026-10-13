@@ -10,7 +10,7 @@ internal sealed class RgfAiCreditIdentityStore
 
     public void Associate(AIProviderRequestContext context, string userId)
     {
-        var identity = identities.GetValue(context, _ => new Identity(userId));
+        var identity = identities.GetValue(context, _ => new Identity(userId, RgfRecrobyUsageCollector.Current));
         if (!StringComparer.Ordinal.Equals(identity.UserId, userId))
             throw new InvalidOperationException("The provider request context is already associated with another authenticated user.");
     }
@@ -19,5 +19,8 @@ internal sealed class RgfAiCreditIdentityStore
         => identities.TryGetValue(context, out var identity) ? identity.UserId
             : throw new InvalidOperationException("The provider request context has no authenticated Credit identity.");
 
-    private sealed record Identity(string UserId);
+    public RgfRecrobyUsageCollector? GetCollector(AIProviderRequestContext context)
+        => identities.TryGetValue(context, out var identity) ? identity.Collector : null;
+
+    private sealed record Identity(string UserId, RgfRecrobyUsageCollector? Collector);
 }

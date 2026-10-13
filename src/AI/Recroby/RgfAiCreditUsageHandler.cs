@@ -31,13 +31,25 @@ public sealed class RgfAiCreditUsageHandler : IAIProviderUsageHandler
     {
         if (context.Usage is not { } usage)
         {
+            identities.GetCollector(context.RequestContext)?.MarkUnknown(context.RequestId);
             logger.LogDebug("Provider request {RequestId} reported no token usage.", context.RequestId);
             return;
         }
 
         var userId = identities.GetUserId(context.RequestContext);
-        await credit.ApplyUsageAsync(userId, new AiCreditUsage(context.RequestId, context.ProviderId,
+        var creditUsage = new AiCreditUsage(context.RequestId, context.ProviderId,
             context.ModelId, context.ExecutionRoute, usage.InputTokens, usage.OutputTokens,
-            usage.TotalTokens, usage.CachedInputTokens, usage.ReasoningTokens), cancellationToken);
+            usage.TotalTokens, usage.CachedInputTokens, usage.ReasoningTokens);
+        var collector = identities.GetCollector(context.RequestContext);
+        try
+        {
+            var result = await credit.ApplyUsageAsync(userId, creditUsage, cancellationToken);
+            collector?.Record(creditUsage, result);
+        }
+        catch
+        {
+            collector?.MarkUnknown(context.RequestId);
+            throw;
+        }
     }
 }

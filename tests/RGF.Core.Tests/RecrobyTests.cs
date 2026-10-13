@@ -29,8 +29,11 @@ public sealed class RecrobyTests
     public async Task EveryModelCallChecksCreditOnceInFreshScopeAndOtherGuardsStillRun()
     {
         await using var fixture = new Fixture();
+        fixture.Credit.Charge = 0.5m;
         var response = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "Hello" }, Token);
         Assert.True(response.Success);
+        Assert.Equal(1m, response.CreditUsage!.ChargedCredit);
+        Assert.Equal(1m, Assert.Single(response.CreditUsage.Models).ChargedCredit);
         Assert.Equal(new[] { "intent", "chat" }, fixture.DefaultChat.Invocations);
         Assert.Equal(new[] { "owner", "owner" }, fixture.Credit.Users);
         Assert.Equal(2, fixture.GuardContexts.Count);

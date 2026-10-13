@@ -1,9 +1,13 @@
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Logging;
 using Recrovit.AI.Core.Workflows;
 using Recrovit.AI.Runtime;
 using Recrovit.RecroGridFramework.Abstraction.Contracts.AI;
+using Recrovit.RecroGridFramework.Abstraction.Contracts.AI.Server;
 using Recrovit.RecroGridFramework.Core.AI.Recroby.Extensions;
+using Recrovit.RecroGridFramework.Identity;
+using Recrovit.RecroGridFramework.Security;
 using System.Security.Cryptography;
 using System.Text.Json;
 
@@ -18,10 +22,14 @@ namespace Recrovit.RecroGridFramework.Core.AI.Recroby;
 /// <param name="protection">Data Protection for user-bound conversation tokens.</param>
 /// <param name="extension">The fallback extension when an extension collection is not supplied.</param>
 /// <param name="logger">The sink for execution failures and safe Credit denial diagnostics.</param>
+/// <param name="credit">The server Credit settlement and state service.</param>
+/// <param name="backendIdentity">Resolves the authenticated HTTP user's RGF identity.</param>
+/// <param name="httpContextAccessor">Provides the authenticated HTTP principal.</param>
 /// <param name="routes">Optional catalog for overrides and the configured-provider precheck.</param>
 /// <param name="extensions">Application selectors; exactly one must match each application turn.</param>
 public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunInspector runs, IDataProtectionProvider protection,
-    IRgfRecrobyExtension extension, ILogger<RgfRecrobyService> logger, AiRouteCatalog? routes = null,
+    IRgfRecrobyExtension extension, ILogger<RgfRecrobyService> logger, IAiCreditService credit, IRgfIdentityService backendIdentity,
+    IHttpContextAccessor httpContextAccessor, AiRouteCatalog? routes = null,
     IEnumerable<IRgfRecrobyExtension>? extensions = null)
 {
     private readonly IDataProtector protector = protection.CreateProtector("RGF.Recroby.ConversationIdentity.v1");
@@ -52,15 +60,79 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
     /// <param name="request">A nonnull request with a nonblank current instruction and verified identity for later turns.</param>
     /// <param name="initialHostContext">Trusted application selection context, or null for a new generic conversation.</param>
     /// <param name="cancellationToken">Cancellation propagated to validation, preparation and workflow calls.</param>
-    /// <returns>A response with protected identity on workflow output; handled failures preserve incoming identity.</returns>
+    /// <returns>A response with protected identity on workflow output and per-turn Credit usage;
+    /// handled failures preserve incoming identity and earlier settled usage. Credit state is queried for the authenticated HTTP user.</returns>
     /// <remarks>Application validation is invoked before preparation, but implementations must enforce access.
     /// Pending resume skips preparation and retains execution settings. Validation, preparation and model-resolution
-    /// failures occur before the workflow error handler and can propagate. Cancellation and authorization errors propagate.</remarks>
+    /// failures occur before the workflow error handler and can propagate. Cancellation and authorization errors propagate.
+    /// Token statistics require backend RGF administrator permission; failed permission checks deny disclosure.</remarks>
     /// <exception cref="UnauthorizedAccessException">Identity is invalid, application selection is ambiguous,
     /// or a prepared workflow differs from the protected conversation workflow.</exception>
     /// <exception cref="ArgumentException">Required input is blank or model settings are invalid.</exception>
     public async Task<RgfAiResponse> ExecuteAsync(string userId, RgfAiRequest request,
         IWorkflowHostContext? initialHostContext, CancellationToken cancellationToken = default)
+    {
+        using var collector = new RgfRecrobyUsageCollector();
+        var response = await ExecuteTurnAsync(userId, request, initialHostContext, cancellationToken);
+        collector.Close();
+        var discloseTokens = false;
+        string? authenticatedUserId = null;
+        try
+        {
+            var principal = httpContextAccessor.HttpContext?.User;
+            if (principal?.Identity?.IsAuthenticated == true)
+                authenticatedUserId = await backendIdentity.GetUserIdAsync(principal);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            logger.LogWarning(exception, "Recroby Credit response identity could not be resolved.");
+        }
+        if (!string.IsNullOrWhiteSpace(authenticatedUserId))
+        {
+            try
+            {
+                discloseTokens = RecroSec.IsAdmin(authenticatedUserId);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                logger.LogWarning(exception, "Recroby token disclosure authorization could not be verified.");
+            }
+            try
+            {
+                var mode = await credit.GetCreditModeAsync(authenticatedUserId, cancellationToken);
+                response.CreditState = new RgfAiCreditState
+                {
+                    Mode = mode,
+                    Prepaid = mode == AiCreditMode.Prepaid
+                        ? await credit.GetPrepaidBalanceAsync(authenticatedUserId, cancellationToken) : null,
+                    Periods = mode == AiCreditMode.Periodic
+                        ? await credit.GetPeriodCreditsAsync(authenticatedUserId, cancellationToken) : []
+                };
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                logger.LogWarning(exception, "Recroby Credit state could not be retrieved after execution.");
+            }
+        }
+        response.Usage = null;
+        response.CreditUsage = collector.Complete(discloseTokens);
+        return response;
+    }
+
+    private async Task<RgfAiResponse> ExecuteTurnAsync(string userId, RgfAiRequest request,
+        IWorkflowHostContext? initialHostContext, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(userId);
         ArgumentNullException.ThrowIfNull(request);
