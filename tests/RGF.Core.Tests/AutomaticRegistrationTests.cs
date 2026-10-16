@@ -53,6 +53,7 @@ public sealed class AutomaticRegistrationTests
         {
             Assert.IsType<TestCreditService>(scope.ServiceProvider.GetRequiredService<IAiCreditService>());
             Assert.Single(scope.ServiceProvider.GetServices<IAIProviderRequestGuard>().OfType<RgfAiCreditRequestGuard>());
+            AiCreditTestState.Authenticate(app.Services);
             var response = await scope.ServiceProvider.GetRequiredService<RgfRecrobyService>()
                 .ExecuteAsync("owner", new() { CurrentUserMessage = "Hello" }, TestContext.Current.CancellationToken);
             Assert.False(response.Success);

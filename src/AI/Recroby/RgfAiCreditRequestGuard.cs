@@ -1,8 +1,6 @@
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
-using System.Globalization;
 using System.Runtime.CompilerServices;
-using System.Security.Claims;
 using Recrovit.AI.Core;
 using Recrovit.RecroGridFramework.Abstraction.Contracts.AI.Server;
 using Recrovit.RecroGridFramework.Identity;
@@ -10,7 +8,7 @@ using Recrovit.RecroGridFramework.Identity;
 namespace Recrovit.RecroGridFramework.Core.AI.Recroby;
 
 // RGF-DOC: rgf.core.ai-credit.integration
-/// <summary>Checks the authenticated HTTP user's Credit before each logical provider request.</summary>
+/// <summary>Checks the authenticated user's Credit before each logical provider request.</summary>
 public sealed class RgfAiCreditRequestGuard : IAIProviderRequestGuard
 {
     private readonly IAiCreditService credit;
@@ -30,51 +28,31 @@ public sealed class RgfAiCreditRequestGuard : IAIProviderRequestGuard
 
     private static readonly ConditionalWeakTable<AIProviderRequestRejectedException, string> RejectionUserNames = new();
 
-    /// <summary>Checks authenticated HTTP Credit access and associates an allowed request with its user.</summary>
+    /// <summary>Checks authenticated Credit access and associates an allowed request with its user.</summary>
     /// <param name="context">The original provider context later used by usage notification.</param>
     /// <param name="cancellationToken">Cancellation of the access check.</param>
-    /// <remarks>Missing HTTP identity is rejected without a Credit query. Denials use stable AiCredit codes.
-    /// No credit is reserved or deducted by this hook; custom context cannot substitute for HTTP identity.</remarks>
-    /// <exception cref="AIProviderRequestRejectedException">HTTP identity is missing or the Credit service denies access.</exception>
+    /// <remarks>Missing authenticated identity is rejected without a Credit query. Denials use stable AiCredit codes.
+    /// No credit is reserved or deducted by this hook; custom context cannot substitute for authenticated identity.</remarks>
+    /// <exception cref="AIProviderRequestRejectedException">Authenticated identity is missing or the Credit service denies access.</exception>
     /// <exception cref="InvalidOperationException">The context is already associated with another user.</exception>
     public async ValueTask BeforeRequestAsync(AIProviderRequestContext context, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var httpContext = httpContextAccessor.HttpContext;
-        if (httpContext?.User.Identity?.IsAuthenticated != true)
-            throw Reject(AiCreditDenialReason.UserNotFound);
-
-        var userId = await identity.GetUserIdAsync(httpContext.User);
-        cancellationToken.ThrowIfCancellationRequested();
-        if (string.IsNullOrWhiteSpace(userId))
-            throw Reject(AiCreditDenialReason.UserNotFound);
-
+        var execution = RgfAiExecutionContext.Current.Value;
+        var authenticated = await RgfAiIdentityResolver.ResolveAsync(identity, httpContextAccessor, cancellationToken);
+        if (authenticated is null) throw Reject(AiCreditDenialReason.UserNotFound);
+        var userId = authenticated.UserId;
         var access = await credit.CheckAccessAsync(userId, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
+        if (execution is { IsActive: false }) throw Reject(AiCreditDenialReason.UserNotFound);
         if (!access.IsAllowed)
         {
             var reason = access.DenialReason!.Value;
-            var userName = reason == AiCreditDenialReason.UserDisabled ? GetUserName(httpContext.User) : null;
+            var userName = reason == AiCreditDenialReason.UserDisabled ? authenticated.UserName : null;
             cancellationToken.ThrowIfCancellationRequested();
             throw Reject(reason, userName);
         }
         identities.Associate(context, userId);
-    }
-
-    private string? GetUserName(ClaimsPrincipal principal)
-    {
-        try
-        {
-            var name = identity.GetUserCredentials(principal)?.UserName?.Trim();
-            return !string.IsNullOrWhiteSpace(name) && name.Length <= 200 && !name.Any(character =>
-                char.GetUnicodeCategory(character) is UnicodeCategory.Control or UnicodeCategory.Format
-                    or UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator)
-                ? name : null;
-        }
-        catch (Exception exception) when (exception is not OperationCanceledException)
-        {
-            return null;
-        }
     }
 
     private static AIProviderRequestRejectedException Reject(AiCreditDenialReason reason, string? userName = null)

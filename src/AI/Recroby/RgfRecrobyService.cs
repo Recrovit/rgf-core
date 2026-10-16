@@ -57,12 +57,12 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
 
     /// <summary>Executes a turn with trusted server-side context used only to prepare a new run.
     /// A pending continuation always retains the stored run's original host context.</summary>
-    /// <param name="userId">Nonblank user ID from the authenticated caller; Credit independently resolves HTTP identity.</param>
+    /// <param name="userId">Nonblank user ID from the authenticated caller; must match the authenticated HTTP or active execution identity.</param>
     /// <param name="request">A nonnull request with a nonblank current instruction and verified identity for later turns.</param>
     /// <param name="initialHostContext">Trusted application selection context, or null for a new generic conversation.</param>
     /// <param name="cancellationToken">Cancellation propagated to validation, preparation and workflow calls.</param>
     /// <returns>A response with protected identity on workflow output and per-turn Credit usage;
-    /// handled failures preserve incoming identity and earlier settled usage. Credit state is queried for the authenticated HTTP user.</returns>
+    /// handled failures preserve incoming identity and earlier settled usage. Credit state is queried for the authenticated turn user.</returns>
     /// <remarks>Application validation is invoked before preparation, but implementations must enforce access.
     /// Pending resume skips preparation and retains execution settings. Validation, preparation and model-resolution
     /// failures occur before the workflow error handler and can propagate. Cancellation and authorization errors propagate.
@@ -70,9 +70,15 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
     /// <exception cref="UnauthorizedAccessException">Identity is invalid, application selection is ambiguous,
     /// or a prepared workflow differs from the protected conversation workflow.</exception>
     /// <exception cref="ArgumentException">Required input is blank or model settings are invalid.</exception>
+    /// <exception cref="InvalidOperationException">The active execution identity already started a Recroby turn.</exception>
     public async Task<RgfAiResponse> ExecuteAsync(string userId, RgfAiRequest request,
         IWorkflowHostContext? initialHostContext, CancellationToken cancellationToken = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(userId);
+        var authenticated = await RgfAiIdentityResolver.ResolveAsync(backendIdentity, httpContextAccessor, cancellationToken);
+        if (authenticated is null || authenticated.UserId != userId)
+            throw new UnauthorizedAccessException("The caller does not match the authenticated RGF user.");
+        RgfAiExecutionContext.Current.Value?.BeginRecrobyTurn();
         using var collector = new RgfRecrobyUsageCollector();
         var response = await ExecuteTurnAsync(userId, request, initialHostContext, cancellationToken);
         collector.Close();
@@ -80,9 +86,8 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
         string? authenticatedUserId = null;
         try
         {
-            var principal = httpContextAccessor.HttpContext?.User;
-            if (principal?.Identity?.IsAuthenticated == true)
-                authenticatedUserId = await backendIdentity.GetUserIdAsync(principal);
+            var current = await RgfAiIdentityResolver.ResolveAsync(backendIdentity, httpContextAccessor, cancellationToken);
+            if (current?.UserId == authenticated.UserId) authenticatedUserId = current.UserId;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

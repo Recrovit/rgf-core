@@ -72,9 +72,11 @@ public sealed class RecrobyCreditUsageTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task MultipleModelsAggregateSettlementsAndJsonDisclosesTokensOnlyToBackendAdmins(bool admin)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task MultipleModelsAggregateSettlementsAndJsonDisclosesTokensOnlyToBackendAdmins(bool admin, bool background)
     {
         await using var fixture = new Fixture(admin: admin);
         fixture.Credit.Charge = 0.125m;
@@ -84,7 +86,13 @@ public sealed class RecrobyCreditUsageTests
             await fixture.Call("two", "provider-A", "alias-A", new(0, null, null, 4, null));
             await fixture.Call("three", "provider-B", "alias-B", new(7, 8, 15, 0, 0));
         };
-        var response = await fixture.Execute();
+        RgfAiResponse response = null!;
+        if (background)
+        {
+            var identity = await fixture.Capture();
+            await identity.RunAsync(async _ => response = await fixture.Execute(), Token);
+        }
+        else response = await fixture.Execute();
         Assert.True(response.Success);
         Assert.Null(response.Usage);
         var usage = Assert.IsType<RgfAiCreditUsage>(response.CreditUsage);
@@ -404,7 +412,7 @@ public sealed class RecrobyCreditUsageTests
         };
         if (identityQuery) fixture.Identity.OnUserId = cancel;
         else fixture.Credit.OnState = _ => cancel();
-        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => fixture.Service.ExecuteAsync("trusted-facade-user",
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => fixture.Service.ExecuteAsync(fixture.UserId,
             new() { CurrentUserMessage = "cancel" }, cancellation.Token));
         Assert.Equal(cancellation.Token, exception.CancellationToken);
         fixture.Identity.OnUserId = null;
@@ -486,8 +494,15 @@ public sealed class RecrobyCreditUsageTests
             cache.GetType().GetMethod("Set")!.Invoke(cache, [UserId, permission, 300]);
         }
 
+        public async Task<IRgfAiExecutionIdentity> Capture()
+        {
+            var identity = await scope.ServiceProvider.GetRequiredService<IRgfAiExecutionIdentityFactory>().CaptureAsync(Token);
+            provider.GetRequiredService<IHttpContextAccessor>().HttpContext = null;
+            return identity;
+        }
+
         public Task<RgfAiResponse> Execute(string message = "hello", RgfAiResponse? previous = null)
-            => Service.ExecuteAsync("trusted-facade-user", new()
+            => Service.ExecuteAsync(UserId, new()
             {
                 CurrentUserMessage = message, ConversationId = previous?.ConversationId,
                 ConversationToken = previous?.ConversationToken,

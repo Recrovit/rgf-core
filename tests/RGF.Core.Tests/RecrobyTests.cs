@@ -111,10 +111,8 @@ public sealed class RecrobyTests
         if (!httpContext) fixture.Http.HttpContext = null;
         else if (anonymous) fixture.Http.HttpContext = new DefaultHttpContext();
         else ((TestIdentityProxy)fixture.Identity).UserId = " ";
-        var response = await fixture.Service.ExecuteAsync("owner", new()
-        { CurrentUserMessage = "Hello", CustomParams = new() { ["userId"] = "owner" } }, Token);
-        Assert.False(response.Success);
-        Assert.Equal("AiCredit.UserNotFound", response.ErrorCode);
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() => fixture.Service.ExecuteAsync("owner", new()
+        { CurrentUserMessage = "Hello", CustomParams = new() { ["userId"] = "owner" } }, Token));
         Assert.Empty(fixture.Credit.Users);
         Assert.Empty(fixture.DefaultChat.Invocations);
         Assert.Empty(fixture.Credit.Usages);
@@ -147,7 +145,7 @@ public sealed class RecrobyTests
         await using var fixture = new Fixture(custom: true, aiAfterResume: true, toolCalling: true);
         var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
         fixture.Http.HttpContext!.User = new System.Security.Claims.ClaimsPrincipal(new System.Security.Claims.ClaimsIdentity(
-            [new System.Security.Claims.Claim(System.Security.Claims.ClaimTypes.NameIdentifier, "authenticated-user")], "test"));
+            [new System.Security.Claims.Claim(System.Security.Claims.ClaimTypes.NameIdentifier, "owner")], "test"));
         ((TestIdentityProxy)fixture.Identity).UsePrincipalUserId = true;
         fixture.Credit.Decisions.Enqueue(null);
         fixture.Credit.Decisions.Enqueue(denySecond ? AiCreditDenialReason.InsufficientCredit : null);
@@ -158,7 +156,7 @@ public sealed class RecrobyTests
         Assert.Equal(denySecond ? 1 : 2, fixture.DefaultChat.Messages.Count);
         Assert.Equal(1, fixture.ToolInvocations);
         Assert.Equal(denySecond ? 1 : 2, fixture.Credit.UsageCalls);
-        Assert.All(fixture.Credit.Usages, call => Assert.Equal("authenticated-user", call.UserId));
+        Assert.All(fixture.Credit.Usages, call => Assert.Equal("owner", call.UserId));
     }
 
     [Theory]
@@ -666,6 +664,145 @@ public sealed class RecrobyTests
         Assert.DoesNotContain(typeof(RgfRecrobyService).Assembly.GetReferencedAssemblies(), a => a.Name!.StartsWith("Schemora"));
     }
 
+    [Theory]
+    [InlineData(AiCreditMode.Unlimited)]
+    [InlineData(AiCreditMode.Periodic)]
+    [InlineData(AiCreditMode.Prepaid)]
+    public async Task BackgroundWorkflowWaitsAndResumesWithFreshIdentityAndGuardedSettlement(AiCreditMode mode)
+    {
+        await using var fixture = new Fixture(custom: true, aiAfterResume: true, toolCalling: true);
+        fixture.Credit.Mode = mode;
+        fixture.Credit.Charge = 2m;
+        fixture.Credit.Prepaid = new(8m, null, false, DateTime.UtcNow);
+        fixture.Credit.Periods = [new(AiCreditPeriodType.Daily, 10m, 2m, DateTime.UtcNow.AddDays(1), DateTime.UtcNow)];
+        fixture.Credit.OnState = user => Assert.Equal("owner", user);
+        var firstIdentity = await fixture.Capture();
+        fixture.Http.HttpContext = null;
+        RgfAiResponse first = null!;
+        await firstIdentity.RunAsync(async ct => first = await fixture.Service.ExecuteAsync("owner",
+            new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), ct), Token);
+        Assert.Equal("WaitingForInput", first.WorkflowStatus);
+        Assert.Equal("More detail?", first.Message);
+        Assert.NotEmpty(first.ConversationToken!);
+        Assert.Equal(mode, first.CreditState!.Mode);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => firstIdentity.RunAsync(_ => Task.CompletedTask, Token));
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() => fixture.Service.ExecuteAsync("owner", Reply(first, "closed"), Token));
+
+        var secondIdentity = await fixture.Capture();
+        fixture.Http.HttpContext = null;
+        RgfAiResponse second = null!;
+        await secondIdentity.RunAsync(async ct => second = await fixture.Service.ExecuteAsync("owner", Reply(first, "ask again"), ct), Token);
+        Assert.Equal("WaitingForInput", second.WorkflowStatus);
+        Assert.Equal(first.WorkflowRunId, second.WorkflowRunId);
+        Assert.Equal(first.ConversationId, second.ConversationId);
+        Assert.Equal(2, fixture.Extension!.Validated);
+        Assert.Empty(fixture.Credit.Users);
+
+        var thirdIdentity = await fixture.Capture();
+        fixture.Http.HttpContext = null;
+        RgfAiResponse third = null!;
+        await thirdIdentity.RunAsync(async ct => third = await fixture.Service.ExecuteAsync("owner", Reply(second, "answer"), ct), Token);
+        Assert.True(third.Success);
+        Assert.Equal("Completed", third.WorkflowStatus);
+        Assert.Equal(first.WorkflowRunId, third.WorkflowRunId);
+        Assert.Equal(3, fixture.Extension.Validated);
+        Assert.Equal(1, fixture.Extension.Prepared);
+        Assert.Equal(new[] { "owner", "owner" }, fixture.Credit.Users);
+        Assert.Equal(2, fixture.Credit.UsageCalls);
+        Assert.All(fixture.Credit.Usages, call => Assert.Equal("owner", call.UserId));
+        Assert.All(fixture.Credit.Instances, credit => Assert.True(credit.Disposed));
+        Assert.Equal(4m, third.CreditUsage!.ChargedCredit);
+        Assert.Equal(2, third.CreditUsage.LlmCallCount);
+        Assert.Equal(mode, third.CreditState!.Mode);
+        Assert.Equal(mode == AiCreditMode.Prepaid ? fixture.Credit.Prepaid : null, third.CreditState.Prepaid);
+        Assert.Equal(mode == AiCreditMode.Periodic ? fixture.Credit.Periods : [], third.CreditState.Periods);
+    }
+
+    [Theory]
+    [InlineData("credit")]
+    [InlineData("domain")]
+    [InlineData("other-user")]
+    [InlineData("wrong-facade-user")]
+    public async Task BackgroundContinuationRechecksAuthorizationBeforeModelCalls(string denial)
+    {
+        await using var fixture = new Fixture(custom: true, aiAfterResume: true);
+        ((TestIdentityProxy)fixture.Identity).UsePrincipalUserId = true;
+        var firstIdentity = await fixture.Capture();
+        fixture.Http.HttpContext = null;
+        RgfAiResponse first = null!;
+        await firstIdentity.RunAsync(async ct => first = await fixture.Service.ExecuteAsync("owner",
+            new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), ct), Token);
+        fixture.Extension!.Allowed = denial != "domain";
+        fixture.Credit.Decisions.Enqueue(AiCreditDenialReason.UserDisabled);
+        var nextIdentity = await fixture.Capture(denial == "other-user" ? "other" : "owner");
+        fixture.Http.HttpContext = null;
+        await nextIdentity.RunAsync(async ct =>
+        {
+            var user = denial is "other-user" or "wrong-facade-user" ? "other" : "owner";
+            if (denial == "credit")
+            {
+                var response = await fixture.Service.ExecuteAsync(user, Reply(first, "answer"), ct);
+                Assert.Equal("AiCredit.UserDisabled", response.ErrorCode);
+                Assert.Equal(first.ConversationToken, response.ConversationToken);
+            }
+            else await Assert.ThrowsAsync<UnauthorizedAccessException>(() => fixture.Service.ExecuteAsync(user, Reply(first, "answer"), ct));
+        }, Token);
+        Assert.Empty(fixture.DefaultChat.Messages);
+        Assert.Empty(fixture.Credit.Usages);
+        Assert.Equal(denial == "credit" ? 1 : 0, fixture.Credit.Users.Count);
+        Assert.Equal(denial is "credit" or "domain" ? 2 : 1, fixture.Extension.Validated);
+    }
+
+    [Fact]
+    public async Task HttpFacadeUserMismatchIsRejectedBeforeExtensionSelection()
+    {
+        await using var fixture = new Fixture(custom: true);
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() => fixture.Service.ExecuteAsync("other",
+            new() { CurrentUserMessage = "first" }, new HostContext("other", 42), Token));
+        Assert.Empty(fixture.Extension!.Selections);
+        Assert.Empty(fixture.Credit.Users);
+        Assert.Empty(fixture.DefaultChat.Messages);
+    }
+    [Theory]
+    [InlineData(AiCreditDenialReason.UserDisabled)]
+    [InlineData(AiCreditDenialReason.InsufficientCredit)]
+    [InlineData(AiCreditDenialReason.BalanceExpired)]
+    public async Task BackgroundModelCallsRecheckCreditAndUseCapturedValidatedName(AiCreditDenialReason reason)
+    {
+        await using var fixture = new Fixture();
+        ((TestIdentityProxy)fixture.Identity).UserName = "  Captured User  ";
+        var identity = await fixture.Capture();
+        ((TestIdentityProxy)fixture.Identity).UserName = "Changed later";
+        fixture.Http.HttpContext = null;
+        fixture.Credit.Decisions.Enqueue(null);
+        fixture.Credit.Decisions.Enqueue(reason);
+        await identity.RunAsync(async ct =>
+        {
+            var response = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "hello" }, ct);
+            Assert.Equal($"AiCredit.{reason}", response.ErrorCode);
+            if (reason == AiCreditDenialReason.UserDisabled)
+                Assert.Equal("AI Credit access is disabled for Captured User.", response.Message);
+            Assert.Equal(1, response.CreditUsage!.LlmCallCount);
+        }, Token);
+        Assert.Equal(new[] { "owner", "owner" }, fixture.Credit.Users);
+        Assert.Equal("owner", Assert.Single(fixture.Credit.Usages).UserId);
+        Assert.Equal("intent", Assert.Single(fixture.DefaultChat.Invocations));
+    }
+    [Fact]
+    public async Task EachRecrobyTurnRequiresANewCapturedExecutionIdentity()
+    {
+        await using var fixture = new Fixture(custom: true);
+        var identity = await fixture.Capture();
+        fixture.Http.HttpContext = null;
+        await identity.RunAsync(async ct =>
+        {
+            var waiting = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" },
+                new HostContext("owner", 42), ct);
+            Assert.Equal("WaitingForInput", waiting.WorkflowStatus);
+            await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Service.ExecuteAsync("owner", Reply(waiting, "answer"), ct));
+            Assert.Equal(1, fixture.Extension!.Validated);
+        }, Token);
+    }
     private static CancellationToken Token => TestContext.Current.CancellationToken;
     private static RgfAiRequest Reply(RgfAiResponse response, string text) => new()
     { ConversationId = response.ConversationId, ConversationToken = response.ConversationToken, CurrentUserMessage = text };
@@ -726,7 +863,7 @@ public sealed class RecrobyTests
             var data = Assert.Single(context.Input.InputData);
             Assert.Equal("domain", data.Role);
             Assert.Equal("domain input", data.Value.Value.GetString());
-            return ValueTask.FromResult(context.Input.CurrentUserInput is null
+            return ValueTask.FromResult(context.Input.CurrentUserInput is null || context.Input.CurrentUserInput.Text == "ask again"
                 ? new DefaultAgentOutput<DecisionResult> { InputRequest = new AgentInputRequest { Message = "More detail?" } }
                 : new DefaultAgentOutput<DecisionResult> { Output = new() { TargetAgentIds = AiAfterResume ? ["host.chat"] : [] }, UserMessage = context.Input.CurrentUserInput.Text });
         }
@@ -818,6 +955,12 @@ public sealed class RecrobyTests
         }
         public async ValueTask DisposeAsync() { await scope.DisposeAsync(); await provider.DisposeAsync(); }
         public void Authenticate(string userId) => AiCreditTestState.Authenticate(provider, userId);
+        public async Task<IRgfAiExecutionIdentity> Capture(string userId = "owner")
+        {
+            Authenticate(userId);
+            await using var captureScope = provider.CreateAsyncScope();
+            return await captureScope.ServiceProvider.GetRequiredService<IRgfAiExecutionIdentityFactory>().CaptureAsync(Token);
+        }
     }
 
     private sealed class ChatClient(string answer) : IChatClient
