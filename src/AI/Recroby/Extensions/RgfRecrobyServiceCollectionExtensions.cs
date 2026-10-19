@@ -26,6 +26,8 @@ public static class RgfRecrobyServiceCollectionExtensions
         }
         services.AddDataProtection();
         services.AddHttpContextAccessor();
+        Metadata.RgfEntityMetadataServiceCollectionExtensions.AddRgfEntityMetadataReader(services);
+        services.TryAddScoped<RgfRecrobyEntityMetadataService>();
         services.TryAddScoped<IRgfAiExecutionIdentityFactory, RgfAiExecutionIdentityFactory>();
         services.TryAddSingleton<RgfAiCreditIdentityStore>();
         services.TryAddEnumerable(ServiceDescriptor.Scoped<Recrovit.AI.Core.IAIProviderRequestGuard, RgfAiCreditRequestGuard>());
