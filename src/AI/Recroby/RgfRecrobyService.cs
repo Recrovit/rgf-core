@@ -207,7 +207,7 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
                 : await workflows.StartWorkflowAsync(execution!.WorkflowId, identity?.ConversationId,
                     userInstruction: request.CurrentUserMessage, inputData: execution.InputData,
                     cancellationToken: cancellationToken, hostContext: execution.HostContext, executionOptions: executionOptions);
-            return new RgfAiResponse
+            var response = new RgfAiResponse
             {
                 Success = output.Status is WorkflowStatus.Completed or WorkflowStatus.WaitingForInput,
                 Message = output.Continuation?.Message ?? output.FinalUserMessage ?? string.Empty,
@@ -217,6 +217,32 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
                 ConversationToken = protector.Protect(JsonSerializer.Serialize(new RgfRecrobyConversationIdentity(
                     userId, output.ConversationId, output.RunId, output.Continuation?.RequestId,
                     identity?.WorkflowId ?? execution!.WorkflowId, modelOverride)))
+            };
+            if (output.Status == WorkflowStatus.WaitingForInput && output.Continuation is { } continuation)
+            {
+                response.ResponseMode = continuation.ResponseMode switch
+                {
+                    ContinuationResponseMode.FreeText => RgfAiResponseMode.FreeText,
+                    ContinuationResponseMode.ChoiceOrText => RgfAiResponseMode.ChoiceOrText,
+                    ContinuationResponseMode.ChoiceOnly => RgfAiResponseMode.ChoiceOnly,
+                    _ => throw new InvalidOperationException("Unsupported continuation response mode.")
+                };
+                response.Choices = await LocalizeChoicesAsync(userId, identity?.WorkflowId ?? execution!.WorkflowId,
+                    output, continuation, cancellationToken);
+            }
+            return response;
+        }
+        catch (WorkflowException exception) when (identity?.RequestId is not null
+            && exception.Code == WorkflowErrorCode.InvalidContinuationResponse)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return new RgfAiResponse
+            {
+                Success = false, ErrorCode = "InvalidContinuationResponse",
+                Message = "The response is not valid for this question. Please choose an available option or provide the requested input.",
+                ConversationId = identity.ConversationId, WorkflowRunId = identity.RunId,
+                WorkflowStatus = WorkflowStatus.WaitingForInput.ToString(),
+                ConversationToken = request.ConversationToken
             };
         }
         catch (Exception exception) when (RgfAiCreditRequestGuard.TryGetRejection(exception, out var code, out var message))
@@ -259,6 +285,53 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
                 ConversationToken = request.ConversationToken
             };
         }
+    }
+
+    private async Task<IReadOnlyList<RgfAiChoice>> LocalizeChoicesAsync(string userId, string workflowId,
+        WorkflowOutput output, ContinuationRequest continuation, CancellationToken cancellationToken)
+    {
+        if (continuation.Choices.Count == 0) return [];
+        cancellationToken.ThrowIfCancellationRequested();
+        var language = RecroDict.DefaultLanguage;
+        try
+        {
+            var user = await backendIdentity.GetRGFUserAsync(userId);
+            if (!string.IsNullOrWhiteSpace(user?.Language)) language = user.Language;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException
+            and not UnauthorizedAccessException and not System.Security.SecurityException)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            // Language is optional display metadata; a lookup failure must not discard the pending workflow response.
+            logger.LogWarning(exception,
+                "Recroby user language lookup failed for user {UserId}, workflow {WorkflowId}; using default language {Language}.",
+                userId, workflowId, language);
+        }
+        // The requesting agent is identified by the pending request, not by execution order.
+        var agentId = output.AgentResults.Last(result => result.Continuation?.RequestId == continuation.RequestId).AgentId;
+        // Configuration must keep the combined scope and key unique under RecroDict's case-insensitive lookup,
+        // including collisions caused by dots in workflow and agent IDs; identifiers are used unchanged.
+        var scope = $"RGF.Recroby.Continuation.{workflowId}.{agentId}";
+        var choices = new List<RgfAiChoice>(continuation.Choices.Count);
+        foreach (var choice in continuation.Choices)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var userText = choice.UserText;
+            try
+            {
+                var (success, value) = await RecroDict.GetTranslationAsync(language, scope, choice.Code);
+                if (success) userText = value;
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                logger.LogWarning(exception,
+                    "Recroby choice translation failed for workflow {WorkflowId}, agent {AgentId}, choice {Code}.",
+                    workflowId, agentId, choice.Code);
+            }
+            choices.Add(new RgfAiChoice { Code = choice.Code, UserText = userText });
+        }
+        return choices;
     }
 
     private static bool HasCreditConfigurationFailure(Exception exception)

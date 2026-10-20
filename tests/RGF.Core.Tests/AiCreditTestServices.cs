@@ -72,6 +72,10 @@ internal sealed class TestCreditService(AiCreditTestState state) : IAiCreditServ
 // DispatchProxy keeps unrelated identity operations outside the Credit fixture.
 public class TestIdentityProxy : DispatchProxy
 {
+    public Dictionary<string, string?> Languages { get; } = [];
+    public List<string> LanguageRequests { get; } = [];
+    public Exception? UserLookupFailure { get; set; }
+    public Action? OnUserLookup { get; set; }
     public string? UserId { get; set; } = "owner";
     public string? UserName { get; set; } = "Test User";
     public bool FailCredentials { get; set; }
@@ -81,6 +85,16 @@ public class TestIdentityProxy : DispatchProxy
     public ClaimsPrincipal? Principal { get; private set; }
     protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
     {
+        if (targetMethod?.Name == nameof(IRgfIdentityService.GetRGFUserAsync))
+        {
+            var userId = (string)args![0]!;
+            LanguageRequests.Add(userId);
+            OnUserLookup?.Invoke();
+            if (UserLookupFailure is not null)
+                return Task.FromException<Recrovit.RecroGridFramework.Identity.Models.RGFUser>(UserLookupFailure);
+            return Task.FromResult(new Recrovit.RecroGridFramework.Identity.Models.RGFUser
+            { UserId = userId, Language = Languages.GetValueOrDefault(userId)! });
+        }
         if (targetMethod?.Name == nameof(IRgfIdentityService.GetUserCredentials))
         {
             if (FailCredentials) throw new InvalidOperationException("private identity detail");

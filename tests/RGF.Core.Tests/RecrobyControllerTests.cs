@@ -17,8 +17,127 @@ using Xunit;
 
 namespace RGF.Core.Tests;
 
+[Collection("Recroby dictionary")]
 public sealed class RecrobyControllerTests
 {
+    [Theory]
+    [InlineData(ContinuationResponseMode.FreeText)]
+    [InlineData(ContinuationResponseMode.ChoiceOrText)]
+    [InlineData(ContinuationResponseMode.ChoiceOnly)]
+    public async Task WaitingResponseSerializesPublicContinuationAndForwardsOriginalInput(ContinuationResponseMode mode)
+    {
+        using var dictionary = new RecrobyDictionaryFixture();
+        dictionary.Add("eng", "RGF.Recroby.Continuation.rgf.recroby.ask", "unused", "Unused");
+        var fixture = new Fixture();
+        fixture.Workflows.Status = WorkflowStatus.WaitingForInput;
+        fixture.Workflows.Continuation = new()
+        {
+            RequestId = "pending", Message = "Choose", ResponseMode = mode,
+            Choices = mode == ContinuationResponseMode.FreeText ? [] : [new() { Code = "  CODE  ", UserText = "Original display" }]
+        };
+        var response = Assert.IsType<RgfAiResponse>(Assert.IsType<OkObjectResult>(
+            (await fixture.Controller.ExecuteAsync(new() { CurrentUserMessage = "first" }, Token)).Result).Value);
+        Assert.True(response.Success);
+        Assert.Equal(mode.ToString(), response.ResponseMode.ToString());
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        var json = JsonSerializer.Serialize(response, options);
+        Assert.Equal(mode.ToString(), JsonDocument.Parse(json).RootElement.GetProperty("responseMode").GetString());
+        Assert.DoesNotContain("llmText", json, StringComparison.OrdinalIgnoreCase);
+        if (mode != ContinuationResponseMode.FreeText)
+        {
+            var choice = Assert.Single(JsonSerializer.Deserialize<RgfAiResponse>(json, options)!.Choices!);
+            Assert.Equal("  CODE  ", choice.Code);
+            Assert.Equal("Original display", choice.UserText);
+        }
+        fixture.Workflows.Failure = new WorkflowException(WorkflowErrorCode.InvalidContinuationResponse, "private detail");
+        var request = new RgfAiRequest { CurrentUserMessage = "  CODE  ", ConversationId = response.ConversationId, ConversationToken = response.ConversationToken };
+        var invalid = Assert.IsType<RgfAiResponse>(Assert.IsType<OkObjectResult>(
+            (await fixture.Controller.ExecuteAsync(request, Token)).Result).Value);
+        Assert.False(invalid.Success);
+        Assert.Equal("InvalidContinuationResponse", invalid.ErrorCode);
+        Assert.Equal("WaitingForInput", invalid.WorkflowStatus);
+        Assert.Equal(response.ConversationToken, invalid.ConversationToken);
+        Assert.Equal(response.ConversationId, invalid.ConversationId);
+        Assert.Equal(response.WorkflowRunId, invalid.WorkflowRunId);
+        Assert.DoesNotContain("private detail", invalid.Message);
+        Assert.Equal("  CODE  ", fixture.Workflows.Submitted!.UserInput);
+        Assert.Null(fixture.Workflows.Submitted.Value);
+        Assert.Equal("pending", fixture.Workflows.RequestId);
+        fixture.Workflows.Failure = null;
+        fixture.Workflows.Status = WorkflowStatus.Completed;
+        var completed = Assert.IsType<RgfAiResponse>(Assert.IsType<OkObjectResult>(
+            (await fixture.Controller.ExecuteAsync(request, Token)).Result).Value);
+        Assert.True(completed.Success);
+        Assert.Null(completed.ResponseMode);
+        Assert.Null(completed.Choices);
+        Assert.Equal(1, fixture.Workflows.Calls);
+    }
+
+    [Fact]
+    public void LegacyResponseJsonOmitsNewFieldsAndDeserializesWithoutContinuation()
+    {
+        var response = JsonSerializer.Deserialize<RgfAiResponse>("""{"Success":true,"Message":"old","ConversationId":"conversation"}""")!;
+        Assert.Null(response.ResponseMode);
+        Assert.Null(response.Choices);
+        var json = JsonSerializer.Serialize(response);
+        Assert.DoesNotContain("ResponseMode", json);
+        Assert.DoesNotContain("Choices", json);
+    }
+
+    [Theory]
+    [InlineData(WorkflowStatus.Completed)]
+    [InlineData(WorkflowStatus.Failed)]
+    [InlineData(WorkflowStatus.Cancelled)]
+    [InlineData(WorkflowStatus.Running)]
+    public async Task NonWaitingOutputsOmitContinuationEvenIfRuntimeSuppliesIt(WorkflowStatus status)
+    {
+        var fixture = new Fixture();
+        fixture.Workflows.Status = status;
+        fixture.Workflows.Continuation = new() { RequestId = "pending", ResponseMode = ContinuationResponseMode.ChoiceOnly,
+            Choices = [new() { Code = "code", UserText = "Choice" }] };
+        var response = Assert.IsType<RgfAiResponse>(Assert.IsType<OkObjectResult>(
+            (await fixture.Controller.ExecuteAsync(new() { CurrentUserMessage = "first" }, Token)).Result).Value);
+        Assert.Null(response.ResponseMode);
+        Assert.Null(response.Choices);
+        Assert.Equal(0, fixture.Identity.LanguageRequests);
+    }
+
+    [Fact]
+    public async Task ConfiguredDictionaryScopesUseUnchangedWorkflowAgentAndChoiceCodes()
+    {
+        using var dictionary = new RecrobyDictionaryFixture();
+        var fixture = new Fixture();
+        fixture.Workflows.Status = WorkflowStatus.WaitingForInput;
+        var configurations = new[]
+        {
+            (Workflow: "host.workflow", Agent: "host.ask"),
+            (Workflow: "other.workflow", Agent: "host.ask"),
+            (Workflow: "host.workflow", Agent: "other.ask")
+        };
+        foreach (var (workflow, agent) in configurations)
+        {
+            var expected = $"{workflow}/{agent}";
+            dictionary.Add("eng", $"RGF.Recroby.Continuation.{workflow}.{agent}", "Approve", expected);
+            dictionary.Add("eng", $"RGF.Recroby.Continuation.{workflow}.{agent}", "reject", expected + " rejected");
+        }
+        foreach (var (workflow, agent) in configurations)
+        {
+            var expected = $"{workflow}/{agent}";
+            fixture.Extension.WorkflowId = workflow;
+            fixture.Workflows.AgentId = agent;
+            fixture.Workflows.Continuation = new() { RequestId = "pending", ResponseMode = ContinuationResponseMode.ChoiceOnly,
+                Choices = [new() { Code = "Approve", UserText = "Original" }, new() { Code = "reject", UserText = "Original rejected" }] };
+            var token = fixture.Protection.CreateProtector("RGF.Recroby.ConversationIdentity.v1").Protect(JsonSerializer.Serialize(new
+                { UserId = "server-user", ConversationId = "conversation", RunId = "previous-run", WorkflowId = workflow }));
+            var response = Assert.IsType<RgfAiResponse>(Assert.IsType<OkObjectResult>(
+                (await fixture.Controller.ExecuteAsync(new() { CurrentUserMessage = "first", ConversationId = "conversation", ConversationToken = token }, Token)).Result).Value);
+            Assert.True(response.Success);
+            Assert.Collection(response.Choices!,
+                choice => { Assert.Equal("Approve", choice.Code); Assert.Equal(expected, choice.UserText); },
+                choice => { Assert.Equal("reject", choice.Code); Assert.Equal(expected + " rejected", choice.UserText); });
+        }
+    }
+
     [Theory]
     [InlineData(0, "AiCredit.InsufficientCredit")]
     [InlineData(1, "AiCredit.InsufficientCredit")]
@@ -228,8 +347,9 @@ public sealed class RecrobyControllerTests
 
     private sealed class RecordingExtension : IRgfRecrobyExtension
     {
+        public string WorkflowId { get; set; } = "test.workflow";
         public bool CanHandle(string? workflowId, IWorkflowHostContext? hostContext)
-            => workflowId == "test.workflow";
+            => workflowId == WorkflowId;
 
         public string? UserId { get; private set; }
         public RgfAiRequest? Request { get; private set; }
@@ -238,12 +358,16 @@ public sealed class RecrobyControllerTests
         {
             UserId = context.UserId;
             Request = request;
-            return ValueTask.FromResult(new RgfRecrobyExecution("test.workflow", context, []));
+            return ValueTask.FromResult(new RgfRecrobyExecution(WorkflowId, context, []));
         }
     }
 
     private sealed class RecordingWorkflows : IWorkflowClient, IWorkflowRunInspector
     {
+        public ContinuationRequest? Continuation { get; set; }
+        public string AgentId { get; set; } = "ask";
+        public ContinuationResponse? Submitted { get; private set; }
+        public string? RequestId { get; private set; }
         public Exception? Failure { get; set; }
         public WorkflowStatus Status { get; set; } = WorkflowStatus.Completed;
         public int Calls { get; private set; }
@@ -262,21 +386,41 @@ public sealed class RecrobyControllerTests
             Context = hostContext;
             Token = cancellationToken;
             if (Failure is not null) throw Failure;
-            return Task.FromResult(new WorkflowOutput
-            { ConversationId = "conversation", RunId = "run", Status = Status, AgentResults = [], Usage = new() { Total = new() }, FinalUserMessage = "workflow answer" });
+            return Task.FromResult(Output());
         }
+        private WorkflowOutput Output() => new()
+        {
+            ConversationId = "conversation", RunId = "run", Status = Status,
+            Continuation = Continuation,
+            AgentResults = Continuation is null ? [] : [new() { AgentId = AgentId, Status = AgentExecutionStatus.WaitingForInput,
+                Continuation = Continuation, Output = new(), EffectiveOutputData = [] }],
+            Usage = new() { Total = new() }, FinalUserMessage = "workflow answer"
+        };
         public Task<WorkflowOutput> ResumeWorkflowAsync(string workflowRunId, string requestId,
-            ContinuationResponse response, CancellationToken cancellationToken = default) => throw new NotSupportedException();
-        public WorkflowRunInfo GetRunInfo(string runId) => throw new NotSupportedException();
+            ContinuationResponse response, CancellationToken cancellationToken = default)
+        {
+            Assert.Equal("run", workflowRunId);
+            Submitted = response;
+            RequestId = requestId;
+            if (Failure is not null) throw Failure;
+            return Task.FromResult(Output());
+        }
+        public WorkflowRunInfo GetRunInfo(string runId) => new(runId, "conversation", "rgf.recroby", Context);
     }
 
     // DispatchProxy avoids implementing unrelated identity operations in this focused adapter fixture.
     private class IdentityProxy : DispatchProxy
     {
+        public int LanguageRequests { get; private set; }
         public string? UserId { get; set; } = "server-user";
         public ClaimsPrincipal? Principal { get; private set; }
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
         {
+            if (targetMethod?.Name == nameof(IRgfIdentityService.GetRGFUserAsync))
+            {
+                LanguageRequests++;
+                return Task.FromResult(new Recrovit.RecroGridFramework.Identity.Models.RGFUser { UserId = UserId!, Language = null! });
+            }
             if (targetMethod?.Name != nameof(IRgfIdentityService.GetUserIdAsync)) throw new NotSupportedException();
             Principal = (ClaimsPrincipal)args![0]!;
             return Task.FromResult(UserId!);

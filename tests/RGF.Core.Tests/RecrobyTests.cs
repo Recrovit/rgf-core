@@ -4,6 +4,7 @@ using Microsoft.Agents.AI;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Recrovit.AI.Core;
 using Recrovit.AI.Core.Conversations;
 using Recrovit.AI.Core.Conversations.History;
@@ -23,8 +24,303 @@ namespace RGF.Core.Tests;
 
 #pragma warning disable MAAI001 // Verify the same routing API used by Recrovit.AI.
 
+[Collection("Recroby dictionary")]
 public sealed class RecrobyTests
 {
+    [Theory]
+    [InlineData(ContinuationResponseMode.FreeText, "free text", "free text")]
+    [InlineData(ContinuationResponseMode.ChoiceOrText, "approve", "private agent instruction")]
+    [InlineData(ContinuationResponseMode.ChoiceOrText, "  custom answer  ", "  custom answer  ")]
+    [InlineData(ContinuationResponseMode.ChoiceOnly, "approve", "private agent instruction")]
+    public async Task RuntimeMapsContinuationModesAndKeepsAgentTextOnServer(
+        ContinuationResponseMode mode, string input, string expected)
+    {
+        using var dictionary = new RecrobyDictionaryFixture();
+        await using var fixture = new Fixture(custom: true, aiAfterResume: true, responseMode: mode);
+        fixture.Credit.Charge = 1m;
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
+        Assert.True(first.Success);
+        Assert.Equal(mode.ToString(), first.ResponseMode.ToString());
+        if (mode == ContinuationResponseMode.FreeText)
+        {
+            Assert.Empty(first.Choices!);
+            Assert.Empty(((TestIdentityProxy)fixture.Identity).LanguageRequests);
+        }
+        else
+        {
+            var choice = Assert.Single(first.Choices!);
+            Assert.Equal("approve", choice.Code);
+            Assert.Equal("Original choice", choice.UserText);
+        }
+        var json = JsonSerializer.Serialize(first);
+        Assert.DoesNotContain("LlmText", json, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private agent instruction", json);
+        var completed = await fixture.Service.ExecuteAsync("owner", Reply(first, input), Token);
+        Assert.True(completed.Success);
+        Assert.Equal(expected, fixture.Decision.Inputs.Last());
+        Assert.Null(completed.ResponseMode);
+        Assert.Null(completed.Choices);
+        Assert.Equal(first.WorkflowRunId, completed.WorkflowRunId);
+        Assert.Equal(1, fixture.Credit.UsageCalls);
+        Assert.Equal(1m, completed.CreditUsage!.ChargedCredit);
+        Assert.Single(fixture.DefaultChat.Messages);
+    }
+
+    [Fact]
+    public async Task InvalidChoiceCanBeCorrectedWithOriginalTokenWithoutConsumingPendingRun()
+    {
+        using var dictionary = new RecrobyDictionaryFixture();
+        await using var fixture = new Fixture(custom: true, aiAfterResume: true, responseMode: ContinuationResponseMode.ChoiceOnly);
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
+        var invalid = await fixture.Service.ExecuteAsync("owner", Reply(first, "invalid"), Token);
+        Assert.False(invalid.Success);
+        Assert.Equal("InvalidContinuationResponse", invalid.ErrorCode);
+        Assert.Equal("WaitingForInput", invalid.WorkflowStatus);
+        Assert.Equal(first.ConversationId, invalid.ConversationId);
+        Assert.Equal(first.WorkflowRunId, invalid.WorkflowRunId);
+        Assert.Equal(first.ConversationToken, invalid.ConversationToken);
+        Assert.NotEmpty(invalid.Message);
+        Assert.Empty(fixture.Credit.Users);
+        Assert.Single(fixture.Decision.Contexts);
+        fixture.Extension!.Allowed = false;
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() => fixture.Service.ExecuteAsync("owner", Reply(invalid, "approve"), Token));
+        fixture.Extension.Allowed = true;
+        var completed = await fixture.Service.ExecuteAsync("owner", Reply(invalid, "approve"), Token);
+        Assert.True(completed.Success);
+        Assert.Equal("Completed", completed.WorkflowStatus);
+        Assert.Equal(first.WorkflowRunId, completed.WorkflowRunId);
+        Assert.Equal(1, fixture.Extension.Prepared);
+        Assert.Equal("private agent instruction", fixture.Decision.Inputs.Last());
+        Assert.Single(fixture.Credit.Users);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ChoicesUseStoredUserLanguageAndDictionaryFallbacksAlsoInBackground(bool background)
+    {
+        using var dictionary = new RecrobyDictionaryFixture();
+        dictionary.Add("eng", "RGF.Recroby.Continuation.host.workflow.host.ask", "approve", "Approve");
+        dictionary.Add("hun", "RGF.Recroby.Continuation.host.workflow.host.ask", "approve", "Jóváhagyás");
+        await using var fixture = new Fixture(custom: true, responseMode: ContinuationResponseMode.ChoiceOnly);
+        var identity = (TestIdentityProxy)fixture.Identity;
+        identity.UsePrincipalUserId = true;
+        identity.Languages["alice"] = "hun";
+        identity.Languages["bob"] = "eng";
+        identity.Languages["missing"] = " ";
+        foreach (var (user, expected) in new[] { ("alice", "Jóváhagyás"), ("bob", "Approve"), ("missing", "Approve") })
+        {
+            RgfAiResponse response = null!;
+            var request = new RgfAiRequest { CurrentUserMessage = "first", CustomParams = new() { ["language"] = "attacker" } };
+            if (background)
+            {
+                var captured = await fixture.Capture(user);
+                fixture.Http.HttpContext = null;
+                await captured.RunAsync(async ct => response = await fixture.Service.ExecuteAsync(user, request, new HostContext(user, 42), ct), Token);
+            }
+            else
+            {
+                fixture.Authenticate(user);
+                response = await fixture.Service.ExecuteAsync(user, request, new HostContext(user, 42), Token);
+            }
+            Assert.True(response.Success);
+            Assert.Equal(expected, Assert.Single(response.Choices!).UserText);
+            Assert.Equal("approve", Assert.Single(response.Choices!).Code);
+        }
+        Assert.Equal(new[] { "alice", "bob", "missing" }, identity.LanguageRequests);
+        Assert.Empty(fixture.Credit.Users);
+    }
+
+    [Fact]
+    public async Task MissingUserTranslationUsesDictionaryDefaultBeforeOriginalChoice()
+    {
+        using var dictionary = new RecrobyDictionaryFixture();
+        dictionary.Add("eng", "RGF.Recroby.Continuation.host.workflow.host.ask", "approve", "Default translation");
+        dictionary.Add("hun", "RGF.Recroby.Continuation.host.workflow.host.ask", "unused", "Unused");
+        await using var fixture = new Fixture(custom: true, responseMode: ContinuationResponseMode.ChoiceOnly);
+        ((TestIdentityProxy)fixture.Identity).Languages["owner"] = "hun";
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
+        Assert.True(first.Success);
+        Assert.Equal("Default translation", Assert.Single(first.Choices!).UserText);
+    }
+
+    [Fact]
+    public async Task TranslationFailurePreservesWaitingIdentityOtherChoicesAndRuntimeResume()
+    {
+        using var dictionary = new RecrobyDictionaryFixture();
+        const string scope = "RGF.Recroby.Continuation.host.workflow.host.ask";
+        dictionary.Add("eng", scope, "before", "Translated before");
+        dictionary.Add("eng", scope, "after", "Translated after");
+        var failure = new InvalidOperationException("Translation lookup failed");
+        dictionary.FailTranslation("eng", scope, "approve", failure);
+        await using var fixture = new Fixture(custom: true, aiAfterResume: true, responseMode: ContinuationResponseMode.ChoiceOnly,
+            choices: [
+                new() { Code = "before", UserText = "Original before", LlmText = "before instruction" },
+                new() { Code = "approve", UserText = "Original choice", LlmText = "private agent instruction" },
+                new() { Code = "after", UserText = "Original after", LlmText = "after instruction" },
+                new() { Code = "missing", UserText = "Original missing", LlmText = "missing instruction" }
+            ]);
+        var waiting = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
+        Assert.True(waiting.Success);
+        Assert.Equal("WaitingForInput", waiting.WorkflowStatus);
+        Assert.Null(waiting.ErrorCode);
+        Assert.NotEmpty(waiting.ConversationToken!);
+        Assert.NotEmpty(waiting.ConversationId);
+        Assert.NotEmpty(waiting.WorkflowRunId!);
+        Assert.Equal(new[] { ("before", "Translated before"), ("approve", "Original choice"),
+            ("after", "Translated after"), ("missing", "Original missing") },
+            waiting.Choices!.Select(choice => (choice.Code, choice.UserText)));
+        var warning = Assert.Single(fixture.Logger.Entries, entry => ReferenceEquals(entry.Exception, failure));
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        Assert.Equal("host.workflow", warning.State["WorkflowId"]);
+        Assert.Equal("host.ask", warning.State["AgentId"]);
+        Assert.Equal("approve", warning.State["Code"]);
+        var protectedIdentity = JsonSerializer.Deserialize<JsonElement>(fixture.Protection
+            .CreateProtector("RGF.Recroby.ConversationIdentity.v1").Unprotect(waiting.ConversationToken!));
+        Assert.Equal(waiting.ConversationId, protectedIdentity.GetProperty("ConversationId").GetString());
+        Assert.Equal(waiting.WorkflowRunId, protectedIdentity.GetProperty("RunId").GetString());
+        Assert.NotEmpty(protectedIdentity.GetProperty("RequestId").GetString()!);
+        var completed = await fixture.Service.ExecuteAsync("owner", Reply(waiting, "approve"), Token);
+        Assert.True(completed.Success);
+        Assert.Equal("Completed", completed.WorkflowStatus);
+        Assert.Equal(waiting.ConversationId, completed.ConversationId);
+        Assert.Equal(waiting.WorkflowRunId, completed.WorkflowRunId);
+        Assert.Equal("private agent instruction", fixture.Decision.Inputs.Last());
+        Assert.Equal(1, fixture.Extension!.Prepared);
+        Assert.Single(fixture.DefaultChat.Messages);
+    }
+
+    [Fact]
+    public async Task UserLanguageLookupFailureUsesDefaultTranslationsAndPreservesPendingRuntimeIdentity()
+    {
+        using var dictionary = new RecrobyDictionaryFixture();
+        dictionary.Add("eng", "RGF.Recroby.Continuation.host.workflow.host.ask", "approve", "Default translation");
+        await using var fixture = new Fixture(custom: true, aiAfterResume: true, responseMode: ContinuationResponseMode.ChoiceOnly,
+            choices: [
+                new() { Code = "approve", UserText = "Original choice", LlmText = "private agent instruction" },
+                new() { Code = "missing", UserText = "Original missing", LlmText = "missing instruction" }
+            ]);
+        var identity = (TestIdentityProxy)fixture.Identity;
+        var failure = new System.Data.DataException("User query failed");
+        identity.UserLookupFailure = failure;
+        var waiting = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
+        Assert.True(waiting.Success);
+        Assert.Null(waiting.ErrorCode);
+        Assert.Equal("WaitingForInput", waiting.WorkflowStatus);
+        Assert.Equal(RgfAiResponseMode.ChoiceOnly, waiting.ResponseMode);
+        Assert.Equal(new[] { ("approve", "Default translation"), ("missing", "Original missing") },
+            waiting.Choices!.Select(choice => (choice.Code, choice.UserText)));
+        Assert.NotEmpty(waiting.ConversationToken!);
+        var protectedIdentity = JsonSerializer.Deserialize<JsonElement>(fixture.Protection
+            .CreateProtector("RGF.Recroby.ConversationIdentity.v1").Unprotect(waiting.ConversationToken!));
+        Assert.Equal(waiting.ConversationId, protectedIdentity.GetProperty("ConversationId").GetString());
+        Assert.Equal(waiting.WorkflowRunId, protectedIdentity.GetProperty("RunId").GetString());
+        Assert.NotEmpty(protectedIdentity.GetProperty("RequestId").GetString()!);
+        var warning = Assert.Single(fixture.Logger.Entries, entry => ReferenceEquals(entry.Exception, failure));
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        Assert.Equal("owner", warning.State["UserId"]);
+        Assert.Equal("host.workflow", warning.State["WorkflowId"]);
+        Assert.Equal(Recrovit.RecroGridFramework.RecroDict.DefaultLanguage, warning.State["Language"]);
+        Assert.Equal("owner", Assert.Single(identity.LanguageRequests));
+        var completed = await fixture.Service.ExecuteAsync("owner", Reply(waiting, "approve"), Token);
+        Assert.True(completed.Success);
+        Assert.Equal("Completed", completed.WorkflowStatus);
+        Assert.Equal(waiting.ConversationId, completed.ConversationId);
+        Assert.Equal(waiting.WorkflowRunId, completed.WorkflowRunId);
+        Assert.Equal("private agent instruction", fixture.Decision.Inputs.Last());
+        Assert.Equal(1, fixture.Extension!.Prepared);
+        Assert.Single(fixture.DefaultChat.Messages);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task UserLanguageLookupCancellationPropagatesWithoutFallback(bool cancelToken, bool otherException)
+    {
+        await using var fixture = new Fixture(custom: true, responseMode: ContinuationResponseMode.ChoiceOnly);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        var identity = (TestIdentityProxy)fixture.Identity;
+        identity.UserLookupFailure = otherException ? new System.Data.DataException("User query failed during cancellation")
+            : new OperationCanceledException(cancellation.Token);
+        if (cancelToken) identity.OnUserLookup = cancellation.Cancel;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => fixture.Service.ExecuteAsync("owner",
+            new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), cancellation.Token));
+        Assert.DoesNotContain(fixture.Logger.Entries, entry => ReferenceEquals(entry.Exception, identity.UserLookupFailure));
+        Assert.Single(fixture.Decision.Contexts);
+    }
+
+    [Fact]
+    public async Task UserLanguageLookupAuthorizationFailurePropagatesWithoutFallback()
+    {
+        await using var fixture = new Fixture(custom: true, responseMode: ContinuationResponseMode.ChoiceOnly);
+        var failure = new UnauthorizedAccessException("User lookup is not authorized");
+        ((TestIdentityProxy)fixture.Identity).UserLookupFailure = failure;
+        var exception = await Assert.ThrowsAsync<UnauthorizedAccessException>(() => fixture.Service.ExecuteAsync("owner",
+            new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token));
+        Assert.Same(failure, exception);
+        Assert.DoesNotContain(fixture.Logger.Entries, entry => ReferenceEquals(entry.Exception, failure));
+    }
+
+    [Fact]
+    public async Task FreeTextContinuationDoesNotQueryUserLanguageEvenWhenLookupWouldFail()
+    {
+        await using var fixture = new Fixture(custom: true, responseMode: ContinuationResponseMode.FreeText);
+        var identity = (TestIdentityProxy)fixture.Identity;
+        identity.UserLookupFailure = new System.Data.DataException("User query must not run");
+        var waiting = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
+        Assert.True(waiting.Success);
+        Assert.Equal("WaitingForInput", waiting.WorkflowStatus);
+        Assert.Equal(RgfAiResponseMode.FreeText, waiting.ResponseMode);
+        Assert.Empty(waiting.Choices!);
+        Assert.Empty(identity.LanguageRequests);
+        Assert.True((await fixture.Service.ExecuteAsync("owner", Reply(waiting, "free answer"), Token)).Success);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task TranslationCancellationPropagatesWithoutFallback(bool cancelToken, bool otherException)
+    {
+        using var dictionary = new RecrobyDictionaryFixture();
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        Exception failure = otherException ? new InvalidOperationException("Lookup failed during cancellation")
+            : new OperationCanceledException(cancellation.Token);
+        dictionary.FailTranslation("eng", "RGF.Recroby.Continuation.host.workflow.host.ask", "approve", failure,
+            cancelToken ? cancellation.Cancel : null);
+        await using var fixture = new Fixture(custom: true, responseMode: ContinuationResponseMode.ChoiceOnly);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => fixture.Service.ExecuteAsync("owner",
+            new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), cancellation.Token));
+        Assert.DoesNotContain(fixture.Logger.Entries, entry => ReferenceEquals(entry.Exception, failure));
+        Assert.Single(fixture.Decision.Contexts);
+    }
+
+    [Fact]
+    public async Task StructuredContinuationRetainsItsContractAndDoesNotResolveChoiceLanguage()
+    {
+        await using var fixture = new Fixture(custom: true, responseMode: ContinuationResponseMode.ChoiceOnly, structured: true);
+        var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
+        Assert.True(first.Success);
+        Assert.Equal(RgfAiResponseMode.FreeText, first.ResponseMode);
+        Assert.Empty(first.Choices!);
+        Assert.Empty(((TestIdentityProxy)fixture.Identity).LanguageRequests);
+        var invalid = await fixture.Service.ExecuteAsync("owner", Reply(first, "approve"), Token);
+        Assert.False(invalid.Success);
+        Assert.Equal("InvalidContinuationResponse", invalid.ErrorCode);
+        Assert.Equal(first.ConversationToken, invalid.ConversationToken);
+        Assert.Single(fixture.Decision.Contexts);
+        var protectedIdentity = JsonSerializer.Deserialize<JsonElement>(fixture.Protection
+            .CreateProtector("RGF.Recroby.ConversationIdentity.v1").Unprotect(first.ConversationToken!));
+        var completed = await fixture.Workflows.ResumeWorkflowAsync(first.WorkflowRunId!,
+            protectedIdentity.GetProperty("RequestId").GetString()!, new()
+            {
+                Value = new() { ContractId = "host.input", Value = JsonSerializer.SerializeToElement("structured answer") }
+            }, Token);
+        Assert.Equal(WorkflowStatus.Completed, completed.Status);
+        Assert.Equal("structured answer", completed.FinalUserMessage);
+    }
+
     [Fact]
     public async Task EveryModelCallChecksCreditOnceInFreshScopeAndOtherGuardsStillRun()
     {
@@ -854,18 +1150,23 @@ public sealed class RecrobyTests
 
     private sealed class AskOnce : IApplicationDecisionHandler
     {
+        public bool Structured { get; set; }
+        public List<string?> Inputs { get; } = [];
         public bool AiAfterResume { get; set; }
         public List<IWorkflowHostContext?> Contexts { get; } = [];
         public ValueTask<DefaultAgentOutput<DecisionResult>> ExecuteAsync(ApplicationDecisionContext context, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
             Contexts.Add(context.HostContext);
+            Inputs.Add(context.Input.CurrentUserInput?.Text);
             var data = Assert.Single(context.Input.InputData);
             Assert.Equal("domain", data.Role);
             Assert.Equal("domain input", data.Value.Value.GetString());
             return ValueTask.FromResult(context.Input.CurrentUserInput is null || context.Input.CurrentUserInput.Text == "ask again"
-                ? new DefaultAgentOutput<DecisionResult> { InputRequest = new AgentInputRequest { Message = "More detail?" } }
-                : new DefaultAgentOutput<DecisionResult> { Output = new() { TargetAgentIds = AiAfterResume ? ["host.chat"] : [] }, UserMessage = context.Input.CurrentUserInput.Text });
+                ? new DefaultAgentOutput<DecisionResult> { InputRequest = new AgentInputRequest
+                    { Message = "More detail?", ExpectedContractId = Structured ? "host.input" : null } }
+                : new DefaultAgentOutput<DecisionResult> { Output = new() { TargetAgentIds = AiAfterResume ? ["host.chat"] : [] },
+                    UserMessage = context.Input.CurrentUserInput.Text ?? context.Input.CurrentUserInput.Value?.Value.GetString() });
         }
     }
 
@@ -888,13 +1189,18 @@ public sealed class RecrobyTests
         public IRgfIdentityService Identity => provider.GetRequiredService<IRgfIdentityService>();
         public IConversationHistoryReader History => provider.GetRequiredService<IConversationHistoryReader>();
         public IConversationExecutor Conversations => provider.GetRequiredService<IConversationExecutor>();
+        public IWorkflowClient Workflows => provider.GetRequiredService<IWorkflowClient>();
         public int ToolInvocations { get; private set; }
+        public RecordingRecrobyLogger Logger { get; } = new();
         public Fixture(bool custom = false, bool aiAfterResume = false, bool multiple = false, bool ambiguous = false, bool reasoning = false,
-            bool toolCalling = false, bool registerCredit = true)
+            bool toolCalling = false, bool registerCredit = true, ContinuationResponseMode? responseMode = null, bool structured = false,
+            IReadOnlyList<ContinuationResponseChoice>? choices = null)
         {
             Decision.AiAfterResume = aiAfterResume;
+            Decision.Structured = structured;
             var services = new ServiceCollection();
             services.AddLogging();
+            services.AddSingleton<ILogger<RgfRecrobyService>>(Logger);
             Credit.Register(services);
             services.AddScoped<IAIProviderRequestGuard>(_ => new RecordingGuard(GuardContexts));
             DefaultChat.CallTool = toolCalling;
@@ -914,7 +1220,13 @@ public sealed class RecrobyTests
                 {
                     Id = "host.workflow", Name = "Host workflow", EntryAgentId = "host.ask",
                     Agents = [new AgentDefinition { Id = "host.ask", Name = "Ask", Type = AgentType.Decision,
-                        DecisionExecutionMode = DecisionExecutionMode.Application, AllowInputRequest = true },
+                        DecisionExecutionMode = DecisionExecutionMode.Application, AllowInputRequest = true,
+                        ResponseConfiguration = responseMode is null ? null : new()
+                        {
+                            Mode = responseMode.Value,
+                            Choices = responseMode == ContinuationResponseMode.FreeText ? [] : choices ??
+                                [new() { Code = "approve", UserText = "Original choice", LlmText = "private agent instruction" }]
+                        } },
                         new AgentDefinition { Id = "host.chat", Name = "Chat", Type = AgentType.Executor,
                             Instruction = "Respond", AllowInputRequest = false, OutputContractId = "rgf.recroby.response",
                             AllowedToolIds = toolCalling ? ["host.tool"] : [],
@@ -1023,6 +1335,16 @@ public sealed class RecrobyTests
         }
     }
 
+    private sealed class RecordingRecrobyLogger : ILogger<RgfRecrobyService>
+    {
+        public List<(LogLevel Level, Exception? Exception, Dictionary<string, object?> State)> Entries { get; } = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => Entries.Add((logLevel, exception, ((IEnumerable<KeyValuePair<string, object?>>)state!).ToDictionary()));
+    }
+
     private sealed class RecordingGuard(List<AIProviderRequestContext> contexts) : IAIProviderRequestGuard
     {
         public ValueTask BeforeRequestAsync(AIProviderRequestContext context, CancellationToken cancellationToken = default)
@@ -1040,4 +1362,73 @@ public sealed class RecrobyTests
             return ValueTask.CompletedTask;
         }
     }
+}
+
+[CollectionDefinition("Recroby dictionary", DisableParallelization = true)]
+public sealed class RecrobyDictionaryCollection;
+
+// RecroDict has a static database-backed cache; seed it without introducing a second localization path.
+internal sealed class RecrobyDictionaryFixture : IDisposable
+{
+    private readonly System.Reflection.FieldInfo field = typeof(Recrovit.RecroGridFramework.RecroDict)
+        .GetField("_localization", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+    private readonly object? original;
+    private readonly System.Collections.IDictionary cache;
+    private readonly Type recordType = typeof(Recrovit.RecroGridFramework.RecroDict)
+        .GetNestedType("RecroDictRec", System.Reflection.BindingFlags.NonPublic)!;
+
+    public RecrobyDictionaryFixture()
+    {
+        original = field.GetValue(null);
+        cache = (System.Collections.IDictionary)Activator.CreateInstance(field.FieldType)!;
+        field.SetValue(null, cache);
+        Add("eng", "RGF.Language", "hun", "Hungarian");
+        Add("eng", "RGF.Language", "eng", "English");
+        Add("eng", "RGF.Recroby.Continuation.host.workflow.host.ask", "unused", "Unused");
+    }
+
+    public void Add(string language, string scope, string key, string value)
+    {
+        if (!cache.Contains(language))
+        {
+            var scopeType = typeof(SortedDictionary<,>).MakeGenericType(typeof(string), typeof(Dictionary<,>).MakeGenericType(typeof(string), recordType));
+            cache[language] = Activator.CreateInstance(scopeType)!;
+        }
+        var scopes = (System.Collections.IDictionary)cache[language]!;
+        if (!scopes.Contains(scope))
+            scopes[scope] = Activator.CreateInstance(typeof(Dictionary<,>).MakeGenericType(typeof(string), recordType))!;
+        var record = Activator.CreateInstance(recordType, nonPublic: true)!;
+        recordType.GetProperty("Key")!.SetValue(record, key);
+        recordType.GetProperty("Value")!.SetValue(record, value);
+        ((System.Collections.IDictionary)scopes[scope]!)[key] = record;
+    }
+
+    public void FailTranslation(string language, string scope, string key, Exception failure, Action? beforeFailure = null)
+    {
+        var scopes = (System.Collections.IDictionary)cache[language]!;
+        var existing = (System.Collections.IDictionary)scopes[scope]!;
+        var comparer = new TranslationFailureComparer(key, failure, beforeFailure);
+        var replacement = (System.Collections.IDictionary)Activator.CreateInstance(existing.GetType(), comparer)!;
+        foreach (System.Collections.DictionaryEntry entry in existing) replacement.Add(entry.Key, entry.Value);
+        scopes[scope] = replacement;
+        comparer.Enabled = true;
+    }
+
+    // Inject failure at the actual RecroDict lookup without changing production localization dependencies.
+    private sealed class TranslationFailureComparer(string key, Exception failure, Action? beforeFailure) : IEqualityComparer<string>
+    {
+        public bool Enabled { get; set; }
+        public bool Equals(string? left, string? right) => StringComparer.OrdinalIgnoreCase.Equals(left, right);
+        public int GetHashCode(string value)
+        {
+            if (Enabled && StringComparer.OrdinalIgnoreCase.Equals(value, key))
+            {
+                beforeFailure?.Invoke();
+                throw failure;
+            }
+            return StringComparer.OrdinalIgnoreCase.GetHashCode(value);
+        }
+    }
+
+    public void Dispose() => field.SetValue(null, original);
 }
