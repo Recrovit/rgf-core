@@ -5,6 +5,7 @@ using System.Security.Claims;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Recrovit.RecroGridFramework;
+using Recrovit.RecroGridFramework.Data;
 using Recrovit.RecroGridFramework.Metadata;
 using Recrovit.RecroGridFramework.Security;
 
@@ -16,7 +17,7 @@ internal sealed class MetadataTestFixture : IDisposable
 {
     private readonly List<Action> restore = [];
     private readonly Type permissionType = typeof(RecroSec).Assembly.GetType("Recrovit.RecroGridFramework.Security.PermissionForUser", true)!;
-    internal readonly ServiceProvider Services = new ServiceCollection().AddRgfEntityMetadataReader().BuildServiceProvider();
+    internal readonly ServiceProvider Services = new ServiceCollection().AddLogging().AddRgfEntityMetadataReader().BuildServiceProvider();
     internal readonly HttpContext Http = new DefaultHttpContext();
     internal readonly IRecroGridContext Context;
     internal readonly List<TestGrid> Grids = [];
@@ -25,6 +26,10 @@ internal sealed class MetadataTestFixture : IDisposable
 
     internal MetadataTestFixture()
     {
+        var applicationServices = typeof(RecroGridConfig).GetProperty("ApplicationServices", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var oldServices = applicationServices.GetValue(null);
+        applicationServices.SetValue(null, Services);
+        restore.Add(() => applicationServices.SetValue(null, oldServices));
         Http.User = new ClaimsPrincipal(new ClaimsIdentity([new Claim(ClaimTypes.NameIdentifier, "metadata-test-owner")], "test"));
         ReplaceStatic(typeof(RecroSec), "_inited", true);
         ReplaceStatic(typeof(RecroSec), "_enabled", true);
@@ -153,9 +158,13 @@ internal sealed class MetadataTestFixture : IDisposable
     public class GridContextProxy : DispatchProxy
     {
         internal HttpContext Http = null!;
+        internal IRGDataContext? Database;
+        internal IRGFLogger Logger = new RGFLogger(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
         protected override object? Invoke(MethodInfo? method, object?[]? args) => method!.Name switch
         {
             "get_UseAsyncInitialization" => true,
+            "get_Logger" => Logger,
+            "get_DbContext" => Database,
             "get_HttpContext" => Http,
             "get_IsTemporary" => false,
             _ => throw new InvalidOperationException($"Database, initialization and business access forbidden: {method.Name}")

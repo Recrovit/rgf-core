@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Query;
 using Microsoft.EntityFrameworkCore.Storage;
 using Recrovit.RecroGridFramework;
+using Recrovit.RecroGridFramework.Data;
 using Recrovit.RecroGridFramework.Metadata;
 using Recrovit.RecroGridFramework.Security;
 
@@ -25,6 +26,10 @@ internal sealed class MetadataConfigurationFixture : IDisposable
     private readonly Dictionary<string, int> permissions = [];
     private int nextPermission = 100000;
     private int nextOption = 1;
+    private readonly Dictionary<int, Type> objectTypes = [];
+    private readonly Array threadServices;
+    private readonly object?[] oldServices;
+    private readonly DbContext dataContext;
     internal readonly ReadGuard Guard = new();
     internal int ContextsCreated;
     internal IRgfEntityMetadataReader Reader { get; }
@@ -47,9 +52,20 @@ internal sealed class MetadataConfigurationFixture : IDisposable
             entity.HasKey(key);
             entity.Property<int>(key).ValueGeneratedNever();
         }
+        model.Entity(propertyType).HasOne(entityType, "RecroGrid_Entity").WithMany().HasForeignKey("EntityId");
         // Query interceptors are singleton services; do not retain a distinct EF provider for every test guard.
         builder.UseInMemoryDatabase(Guid.NewGuid().ToString(), new InMemoryDatabaseRoot()).UseModel(model.FinalizeModel()).AddInterceptors(Guard)
             .EnableServiceProviderCaching(false);
+        // The normal Entity loader reads Properties and options through TSContext, including cache hits.
+        threadServices = (Array)contextType.GetField("_threadSafeDbContext", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
+        oldServices = threadServices.Cast<object?>().ToArray();
+        dataContext = Context();
+        MetadataTestFixture.Set(dataContext, "_noTracking", true);
+        ((MetadataTestFixture.GridContextProxy)host.Context).Database = (IRGDataContext)dataContext;
+        var serviceType = FrameworkType("Data.RGThreadSafeDataService");
+        Func<IRGDataContext> dataFactory = () => (IRGDataContext)dataContext;
+        var service = Activator.CreateInstance(serviceType, [dataFactory]);
+        for (int i = 0; i < threadServices.Length; i++) threadServices.SetValue(service, i);
         Func<DbContext> factory = Context;
         var typed = Expression.Lambda(typeof(Func<>).MakeGenericType(contextType),
             Expression.Convert(Expression.Invoke(Expression.Constant(factory)), contextType)).Compile();
@@ -76,9 +92,11 @@ internal sealed class MetadataConfigurationFixture : IDisposable
         gridType ??= typeof(RecroGridDyn<>);
         var definition = $"{gridType.FullName},{gridType.Assembly.GetName().Name},{objectType.FullName},{objectType.Assembly.GetName().Name}";
         names[id] = name;
+        objectTypes[id] = objectType;
         Seed(entityType, ("EntityId", id), ("EntityName", name), ("EntityVersion", "1"), ("TypeDefinition", definition),
             ("Category", 1), ("EntityComment", "Target description"));
         Grant(name, true);
+        WarmEntity(id);
     }
 
     internal void Property(int entityId, int id, string name, int? target = null, bool readable = true, string? alias = null)
@@ -88,10 +106,14 @@ internal sealed class MetadataConfigurationFixture : IDisposable
             ("FormType", target != null && !name.Contains('.') ? (int)RecroGrid.RGProperty.FormTypeEnum.Entity : (int)RecroGrid.RGProperty.FormTypeEnum.TextBox),
             ("PropertyComment", "Target field comment"));
         Grant(names[entityId] + "/" + (alias ?? name.Replace('.', '_')), true);
+        WarmEntity(entityId);
     }
 
     internal void Option(int entityId, string key, string value, int? propertyId = null)
-        => Seed(optionType, ("Id", nextOption++), ("EntityId", entityId), ("PropertyId", propertyId), ("OptionKey", key), ("OptionValue", value));
+    {
+        Seed(optionType, ("Id", nextOption++), ("EntityId", entityId), ("PropertyId", propertyId), ("OptionKey", key), ("OptionValue", value));
+        WarmEntity(entityId);
+    }
 
     internal void Grant(string name, bool allowed)
     {
@@ -131,6 +153,11 @@ internal sealed class MetadataConfigurationFixture : IDisposable
     public void Dispose()
     {
         host.OverrideReader = null;
+        ((MetadataTestFixture.GridContextProxy)host.Context).Database = null;
+        for (int i = 0; i < threadServices.Length; i++) threadServices.SetValue(oldServices[i], i);
+        dataContext.Dispose();
+        foreach (var id in names.Keys)
+            typeof(RecroGrid.RGEntity).GetMethod("RemoveFromCache", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, [id]);
         using var context = Context();
         context.Database.EnsureDeleted();
     }
@@ -150,6 +177,25 @@ internal sealed class MetadataConfigurationFixture : IDisposable
             context.SaveChanges();
         }
         finally { Guard.Seeding = false; }
+        foreach (var entityId in names.Keys) WarmEntity(entityId);
+    }
+
+    private void WarmEntity(int id)
+    {
+        // Simulate the Entity definition cached by normal initialization. Property/option loading remains real.
+        using var context = Context();
+        var row = context.Find(entityType, id)!;
+        var entity = (RecroGrid.RGEntity)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(RecroGrid.RGEntity));
+        foreach (var name in new[] { "EntityId", "EntityName", "EntityVersion", "EntityComment", "TypeDefinition" })
+            MetadataTestFixture.Set(entity, name, entityType.GetProperty(name)!.GetValue(row));
+        MetadataTestFixture.Set(entity, "Category", Enum.ToObject(typeof(RecroGrid.RGEntity.CategoryEnum), entityType.GetProperty("Category")!.GetValue(row)!));
+        MetadataTestFixture.Set(entity, "EntityObjectType", objectTypes[id]);
+        entity.SetTitle((string?)entityType.GetProperty("Title")!.GetValue(row));
+        var key = $"{entity.EntityName.ToLowerInvariant()}_{entity.EntityVersion}";
+        var map = (ConcurrentDictionary<int, string>)typeof(RecroGrid.RGEntity).GetField("_entityId2NameVersion", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
+        map[id] = key;
+        var cache = typeof(RecroGrid.RGEntity).GetProperty("_rgCache", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
+        cache.GetType().GetMethod("Set")!.Invoke(cache, [key, entity, 300]);
     }
 
     internal sealed class ProductRecord
