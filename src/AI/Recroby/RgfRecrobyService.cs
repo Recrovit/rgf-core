@@ -311,7 +311,7 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
         var agentId = output.AgentResults.Last(result => result.Continuation?.RequestId == continuation.RequestId).AgentId;
         // Configuration must keep the combined scope and key unique under RecroDict's case-insensitive lookup,
         // including collisions caused by dots in workflow and agent IDs; identifiers are used unchanged.
-        var scope = $"RGF.Recroby.Continuation.{workflowId}.{agentId}";
+        var scope = $"Recroby.WF.{workflowId}.{agentId}";
         var choices = new List<RgfAiChoice>(continuation.Choices.Count);
         foreach (var choice in continuation.Choices)
         {

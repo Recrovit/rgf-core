@@ -27,7 +27,7 @@ public sealed class RecrobyControllerTests
     public async Task WaitingResponseSerializesPublicContinuationAndForwardsOriginalInput(ContinuationResponseMode mode)
     {
         using var dictionary = new RecrobyDictionaryFixture();
-        dictionary.Add("eng", "RGF.Recroby.Continuation.rgf.recroby.ask", "unused", "Unused");
+        dictionary.Add("eng", "Recroby.WF.rgf.recroby.ask", "unused", "Unused");
         var fixture = new Fixture();
         fixture.Workflows.Status = WorkflowStatus.WaitingForInput;
         fixture.Workflows.Continuation = new()
@@ -117,8 +117,8 @@ public sealed class RecrobyControllerTests
         foreach (var (workflow, agent) in configurations)
         {
             var expected = $"{workflow}/{agent}";
-            dictionary.Add("eng", $"RGF.Recroby.Continuation.{workflow}.{agent}", "Approve", expected);
-            dictionary.Add("eng", $"RGF.Recroby.Continuation.{workflow}.{agent}", "reject", expected + " rejected");
+            dictionary.Add("eng", $"Recroby.WF.{workflow}.{agent}", "Approve", expected);
+            dictionary.Add("eng", $"Recroby.WF.{workflow}.{agent}", "reject", expected + " rejected");
         }
         foreach (var (workflow, agent) in configurations)
         {

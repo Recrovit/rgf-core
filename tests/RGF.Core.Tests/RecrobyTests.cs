@@ -100,8 +100,8 @@ public sealed class RecrobyTests
     public async Task ChoicesUseStoredUserLanguageAndDictionaryFallbacksAlsoInBackground(bool background)
     {
         using var dictionary = new RecrobyDictionaryFixture();
-        dictionary.Add("eng", "RGF.Recroby.Continuation.host.workflow.host.ask", "approve", "Approve");
-        dictionary.Add("hun", "RGF.Recroby.Continuation.host.workflow.host.ask", "approve", "Jóváhagyás");
+        dictionary.Add("eng", "Recroby.WF.host.workflow.host.ask", "approve", "Approve");
+        dictionary.Add("hun", "Recroby.WF.host.workflow.host.ask", "approve", "Jóváhagyás");
         await using var fixture = new Fixture(custom: true, responseMode: ContinuationResponseMode.ChoiceOnly);
         var identity = (TestIdentityProxy)fixture.Identity;
         identity.UsePrincipalUserId = true;
@@ -135,8 +135,8 @@ public sealed class RecrobyTests
     public async Task MissingUserTranslationUsesDictionaryDefaultBeforeOriginalChoice()
     {
         using var dictionary = new RecrobyDictionaryFixture();
-        dictionary.Add("eng", "RGF.Recroby.Continuation.host.workflow.host.ask", "approve", "Default translation");
-        dictionary.Add("hun", "RGF.Recroby.Continuation.host.workflow.host.ask", "unused", "Unused");
+        dictionary.Add("eng", "Recroby.WF.host.workflow.host.ask", "approve", "Default translation");
+        dictionary.Add("hun", "Recroby.WF.host.workflow.host.ask", "unused", "Unused");
         await using var fixture = new Fixture(custom: true, responseMode: ContinuationResponseMode.ChoiceOnly);
         ((TestIdentityProxy)fixture.Identity).Languages["owner"] = "hun";
         var first = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "first" }, new HostContext("owner", 42), Token);
@@ -148,7 +148,7 @@ public sealed class RecrobyTests
     public async Task TranslationFailurePreservesWaitingIdentityOtherChoicesAndRuntimeResume()
     {
         using var dictionary = new RecrobyDictionaryFixture();
-        const string scope = "RGF.Recroby.Continuation.host.workflow.host.ask";
+        const string scope = "Recroby.WF.host.workflow.host.ask";
         dictionary.Add("eng", scope, "before", "Translated before");
         dictionary.Add("eng", scope, "after", "Translated after");
         var failure = new InvalidOperationException("Translation lookup failed");
@@ -194,7 +194,7 @@ public sealed class RecrobyTests
     public async Task UserLanguageLookupFailureUsesDefaultTranslationsAndPreservesPendingRuntimeIdentity()
     {
         using var dictionary = new RecrobyDictionaryFixture();
-        dictionary.Add("eng", "RGF.Recroby.Continuation.host.workflow.host.ask", "approve", "Default translation");
+        dictionary.Add("eng", "Recroby.WF.host.workflow.host.ask", "approve", "Default translation");
         await using var fixture = new Fixture(custom: true, aiAfterResume: true, responseMode: ContinuationResponseMode.ChoiceOnly,
             choices: [
                 new() { Code = "approve", UserText = "Original choice", LlmText = "private agent instruction" },
@@ -287,7 +287,7 @@ public sealed class RecrobyTests
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(Token);
         Exception failure = otherException ? new InvalidOperationException("Lookup failed during cancellation")
             : new OperationCanceledException(cancellation.Token);
-        dictionary.FailTranslation("eng", "RGF.Recroby.Continuation.host.workflow.host.ask", "approve", failure,
+        dictionary.FailTranslation("eng", "Recroby.WF.host.workflow.host.ask", "approve", failure,
             cancelToken ? cancellation.Cancel : null);
         await using var fixture = new Fixture(custom: true, responseMode: ContinuationResponseMode.ChoiceOnly);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => fixture.Service.ExecuteAsync("owner",
@@ -1215,7 +1215,7 @@ public sealed class RecrobyTests
                         ToolInvocations++;
                         return ValueTask.FromResult(new ApplicationToolResult { Output = input! });
                     });
-                configuration.Decisions.Register("host.ask", Decision);
+                configuration.Decisions.Register("host.workflow", "host.ask", Decision);
                 configuration.Workflows.Register(new WorkflowDefinition
                 {
                     Id = "host.workflow", Name = "Host workflow", EntryAgentId = "host.ask",
@@ -1384,7 +1384,7 @@ internal sealed class RecrobyDictionaryFixture : IDisposable
         field.SetValue(null, cache);
         Add("eng", "RGF.Language", "hun", "Hungarian");
         Add("eng", "RGF.Language", "eng", "English");
-        Add("eng", "RGF.Recroby.Continuation.host.workflow.host.ask", "unused", "Unused");
+        Add("eng", "Recroby.WF.host.workflow.host.ask", "unused", "Unused");
     }
 
     public void Add(string language, string scope, string key, string value)
