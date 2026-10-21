@@ -24,7 +24,8 @@ public sealed class AiExecutionIdentityTests
     private static async Task Check(IServiceProvider provider)
     {
         await using var scope = provider.CreateAsyncScope();
-        await scope.ServiceProvider.GetServices<IAIProviderRequestGuard>().Single().BeforeRequestAsync(new(), Token);
+        foreach (var guard in scope.ServiceProvider.GetServices<IAIProviderRequestGuard>())
+            await guard.BeforeRequestAsync(new(), Token);
     }
     private static async Task<IRgfAiExecutionIdentity> Capture(IServiceProvider provider, string user = "owner")
     {

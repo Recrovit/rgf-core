@@ -15,6 +15,7 @@ using System.Text.Json;
 namespace Recrovit.RecroGridFramework.Core.AI.Recroby;
 
 // RGF-DOC: rgf.core.recroby.architecture
+// RGF-DOC: rgf.legacy.rgf-ai.entity-conversation
 // RGF-DOC: rgf.core.ai-credit.integration
 /// <summary>Executes protected conversation turns over the shared Recrovit.AI workflow runtime.</summary>
 /// <remarks>Application access checks are the selected extension's responsibility; its default validation hook is a no-op.</remarks>
@@ -243,6 +244,17 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
                 ConversationId = identity.ConversationId, WorkflowRunId = identity.RunId,
                 WorkflowStatus = WorkflowStatus.WaitingForInput.ToString(),
                 ConversationToken = request.ConversationToken
+            };
+        }
+        catch (Exception exception) when (RgfRecrobyMetadataHistoryGuard.IsRejection(exception))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return new RgfAiResponse
+            {
+                Success = false, ErrorCode = RgfRecrobyMetadataHistoryGuard.RejectionCode,
+                Message = RgfRecrobyMetadataHistoryGuard.RejectionMessage,
+                ConversationId = identity?.ConversationId ?? string.Empty,
+                WorkflowRunId = identity?.RunId, ConversationToken = request.ConversationToken
             };
         }
         catch (Exception exception) when (RgfAiCreditRequestGuard.TryGetRejection(exception, out var code, out var message))

@@ -98,7 +98,7 @@ public sealed class AiCreditRequestGuardTests
         AiCreditTestState.Authenticate(provider);
         await using var first = provider.CreateAsyncScope();
         await using var second = provider.CreateAsyncScope();
-        Assert.Equal(2, first.ServiceProvider.GetServices<IAIProviderRequestGuard>().Count());
+        Assert.Equal(3, first.ServiceProvider.GetServices<IAIProviderRequestGuard>().Count());
         Assert.Same(Guard(first.ServiceProvider), Guard(first.ServiceProvider));
         Assert.NotSame(Guard(first.ServiceProvider), Guard(second.ServiceProvider));
         await Guard(first.ServiceProvider).BeforeRequestAsync(new(), Token);

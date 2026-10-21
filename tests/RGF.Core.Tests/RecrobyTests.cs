@@ -25,7 +25,7 @@ namespace RGF.Core.Tests;
 #pragma warning disable MAAI001 // Verify the same routing API used by Recrovit.AI.
 
 [Collection("Recroby dictionary")]
-public sealed class RecrobyTests
+public sealed partial class RecrobyTests
 {
     [Theory]
     [InlineData(ContinuationResponseMode.FreeText, "free text", "free text")]
@@ -704,15 +704,16 @@ public sealed class RecrobyTests
             Assert.Equal(ExecutorExecutionMode.AI, terminal.ExecutorExecutionMode);
             Assert.False(terminal.AllowInputRequest);
             Assert.Equal("rgf.recroby.response", terminal.OutputContractId);
-            Assert.Empty(terminal.AllowedToolIds);
+            if (key == "chat") Assert.Empty(terminal.AllowedToolIds);
+            else Assert.Equal(new[] { "rgf.recroby.metadata.catalog.search", "rgf.recroby.metadata.entity.read" }, terminal.AllowedToolIds);
             Assert.DoesNotContain(workflow.Relations, relation => relation.SourceAgentId == terminal.Id);
-            if (key == "chat") Assert.True(terminal.IncludeConversationHistory);
+            Assert.True(terminal.IncludeConversationHistory);
         }
     }
 
     [Theory]
     [InlineData("chat", "default answer")]
-    [InlineData("application", "Application-specific request handling is not implemented yet.")]
+    [InlineData("application", "The requested application capability is not supported.")]
     public async Task IntentRoutesToSelectedTerminalResponse(string decisionKey, string expectedAnswer)
     {
         await using var fixture = new Fixture();
@@ -1179,6 +1180,7 @@ public sealed class RecrobyTests
         public AskOnce Decision { get; } = new();
         public RgfRecrobyService Service { get; }
         public WorkflowDefinition DefaultWorkflow => provider.GetRequiredService<WorkflowRegistry>().Get("rgf.recroby");
+        public RecrovitWorkflowConfiguration Configuration => provider.GetRequiredService<RecrovitWorkflowConfiguration>();
         public HostExtension? Extension { get; }
         public OtherExtension? OtherExtension { get; }
         public IDataProtectionProvider Protection { get; } = new EphemeralDataProtectionProvider();
@@ -1194,12 +1196,19 @@ public sealed class RecrobyTests
         public RecordingRecrobyLogger Logger { get; } = new();
         public Fixture(bool custom = false, bool aiAfterResume = false, bool multiple = false, bool ambiguous = false, bool reasoning = false,
             bool toolCalling = false, bool registerCredit = true, ContinuationResponseMode? responseMode = null, bool structured = false,
-            IReadOnlyList<ContinuationResponseChoice>? choices = null)
+            IReadOnlyList<ContinuationResponseChoice>? choices = null,
+            Recrovit.RecroGridFramework.Metadata.IRgfEntityMetadataReader? metadataReader = null)
         {
             Decision.AiAfterResume = aiAfterResume;
             Decision.Structured = structured;
             var services = new ServiceCollection();
             services.AddLogging();
+            if (metadataReader is not null)
+            {
+                services.AddSingleton(metadataReader);
+                services.AddScoped(typeof(Recrovit.RecroGridFramework.RecroGrid).Assembly.GetType(
+                    "Recrovit.RecroGridFramework.Services.RgfSessionService", true)!);
+            }
             services.AddSingleton<ILogger<RgfRecrobyService>>(Logger);
             Credit.Register(services);
             services.AddScoped<IAIProviderRequestGuard>(_ => new RecordingGuard(GuardContexts));
@@ -1256,6 +1265,13 @@ public sealed class RecrobyTests
             provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
             scope = provider.CreateAsyncScope();
             AiCreditTestState.Authenticate(provider);
+            Http.HttpContext!.RequestServices = scope.ServiceProvider;
+            if (metadataReader is not null)
+            {
+                ((TestIdentityProxy)Identity).UsePrincipalUserId = true;
+                Authenticate("metadata-test-owner");
+                Http.HttpContext!.RequestServices = scope.ServiceProvider;
+            }
             Service = scope.ServiceProvider.GetRequiredService<RgfRecrobyService>();
             var extensions = scope.ServiceProvider.GetServices<IRgfRecrobyExtension>().ToArray();
             if (custom) Extension = Assert.Single(extensions.OfType<HostExtension>(), candidate => candidate.GetType() == typeof(HostExtension));
@@ -1291,6 +1307,7 @@ public sealed class RecrobyTests
         public List<string> Invocations { get; } = [];
         public List<AIReasoningOptions?> Reasoning { get; } = [];
         public Queue<string> DecisionKeys { get; } = new();
+        public Queue<(string Tool, Dictionary<string, object?> Arguments)> MetadataCalls { get; } = new();
         public void Dispose() { }
         public object? GetService(Type type, object? key = null) => type.IsInstanceOfType(this) ? this : null;
         public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
@@ -1298,6 +1315,10 @@ public sealed class RecrobyTests
             cancellationToken.ThrowIfCancellationRequested();
             Messages.Add(messages.ToArray());
             Reasoning.Add(AIReasoningChatOptions.Get(options));
+            if (options?.Instructions?.Contains("Answer application Entity structure questions", StringComparison.Ordinal) == true
+                && MetadataCalls.TryDequeue(out var metadataCall))
+                return Result(new ChatMessage(ChatRole.Assistant,
+                    [new FunctionCallContent(Guid.NewGuid().ToString(), metadataCall.Tool, metadataCall.Arguments)]));
             if (CallTool && Messages.Count == 1)
                 return Result(new ChatMessage(ChatRole.Assistant,
                     [new FunctionCallContent("call-1", "host_tool", new Dictionary<string, object?> { ["text"] = "input" })]));
@@ -1313,9 +1334,9 @@ public sealed class RecrobyTests
                     JsonSerializer.Serialize(new { userMessage = (string?)null, output = new { decisionKey = key } })));
             }
             Assert.Contains("string", output.GetProperty("type").EnumerateArray().Select(type => type.GetString()));
-            var application = options!.Instructions?.Contains("application-specific request handling is not implemented yet.", StringComparison.Ordinal) == true;
+            var application = options!.Instructions?.Contains("Answer application Entity structure questions", StringComparison.Ordinal) == true;
             Invocations.Add(application ? "application" : "chat");
-            var response = application ? "Application-specific request handling is not implemented yet." : answer;
+            var response = application ? "The requested application capability is not supported." : answer;
             return Result(new ChatMessage(ChatRole.Assistant,
                 JsonSerializer.Serialize(new { userMessage = response, output = response })));
         }

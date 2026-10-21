@@ -6,6 +6,7 @@ namespace Recrovit.RecroGridFramework.Core.AI.Recroby.Extensions;
 
 // RGF-DOC: rgf.core.initialization
 // RGF-DOC: rgf.core.recroby.architecture
+// RGF-DOC: rgf.legacy.rgf-ai.entity-conversation
 // RGF-DOC: rgf.core.ai-credit.integration
 /// <summary>Registers the Recroby facade, workflow and provider Credit hooks.</summary>
 public static class RgfRecrobyServiceCollectionExtensions
@@ -22,12 +23,19 @@ public static class RgfRecrobyServiceCollectionExtensions
         {
             services.AddSingleton(new RecrobyRegistration());
             Recrovit.AI.Core.DependencyInjection.ServiceCollectionExtensions.AddRecrovitAICore(services,
-                Workflows.RgfRecrobyWorkflowConfigurationExtensions.AddDefaultRecrobyWorkflow);
+                (provider, configuration) =>
+                {
+                    Workflows.RgfRecrobyWorkflowConfigurationExtensions.AddDefaultRecrobyWorkflow(configuration);
+                    Workflows.RgfRecrobyMetadataTools.Register(configuration, provider.GetRequiredService<IServiceScopeFactory>());
+                });
         }
         services.AddDataProtection();
         services.AddHttpContextAccessor();
         Metadata.RgfEntityMetadataServiceCollectionExtensions.AddRgfEntityMetadataReader(services);
         services.TryAddScoped<RgfRecrobyEntityMetadataService>();
+        services.TryAddScoped<Workflows.RgfRecrobyMetadataAccess>();
+        services.TryAddSingleton<RgfRecrobyMetadataDisclosures>();
+        services.TryAddEnumerable(ServiceDescriptor.Scoped<Recrovit.AI.Core.IAIProviderRequestGuard, RgfRecrobyMetadataHistoryGuard>());
         services.TryAddScoped<IRgfAiExecutionIdentityFactory, RgfAiExecutionIdentityFactory>();
         services.TryAddSingleton<RgfAiCreditIdentityStore>();
         services.TryAddEnumerable(ServiceDescriptor.Scoped<Recrovit.AI.Core.IAIProviderRequestGuard, RgfAiCreditRequestGuard>());
