@@ -22,6 +22,9 @@ public static class RgfRecrobyServiceCollectionExtensions
         if (!services.Any(descriptor => descriptor.ServiceType == typeof(RecrobyRegistration)))
         {
             services.AddSingleton(new RecrobyRegistration());
+            services.AddKeyedSingleton<Func<Exception, bool>>("Recrovit.AI.ConfigurationFailure",
+                (_, _) => exception => exception is Recrovit.RecroGridFramework.AI.AiCreditConfigurationException
+                    or System.ClientModel.ClientResultException { Status: 401 });
             Recrovit.AI.Core.DependencyInjection.ServiceCollectionExtensions.AddRecrovitAICore(services,
                 (provider, configuration) =>
                 {

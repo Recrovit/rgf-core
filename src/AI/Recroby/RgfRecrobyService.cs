@@ -260,7 +260,13 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
         catch (Exception exception) when (RgfAiCreditRequestGuard.TryGetRejection(exception, out var code, out var message))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            logger.LogWarning("Recroby Credit access was rejected with {ReasonCode} for conversation {ConversationId}.",
+            var level = code switch
+            {
+                "AiCredit.UserDisabled" or "AiCredit.InsufficientCredit" or "AiCredit.BalanceExpired" => LogLevel.Information,
+                "AiCredit.InfrastructureFailure" => LogLevel.Error,
+                _ => LogLevel.Warning
+            };
+            logger.Log(level, "Recroby Credit access was rejected with {ReasonCode} for conversation {ConversationId}.",
                 code, identity?.ConversationId);
             return new RgfAiResponse
             {
@@ -272,11 +278,29 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
                 ConversationToken = request.ConversationToken
             };
         }
+        catch (Exception exception) when (IsOnlyFailure(exception,
+            current => current is System.ClientModel.ClientResultException { Status: 401 }))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            logger.LogWarning("Recroby provider authentication failed for conversation {ConversationId}.", identity?.ConversationId);
+            return new RgfAiResponse
+            {
+                Success = false, ErrorCode = RgfAiErrorCodes.AiProviderAuthenticationFailed,
+                Message = "Recroby could not complete the request due to a configuration error. Please contact your system administrator.",
+                ConversationId = identity?.ConversationId ?? string.Empty,
+                WorkflowRunId = identity?.RunId, WorkflowStatus = WorkflowStatus.Failed.ToString(),
+                ConversationToken = request.ConversationToken
+            };
+        }
         catch (Exception exception) when (exception is not OperationCanceledException and not UnauthorizedAccessException
             && HasCreditConfigurationFailure(exception))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            logger.LogError(exception, "Recroby Credit configuration failed for conversation {ConversationId}.", identity?.ConversationId);
+            if (IsOnlyCreditConfigurationFailure(exception))
+                logger.LogWarning("Recroby Credit configuration failed for conversation {ConversationId}: {Diagnostic}",
+                    identity?.ConversationId, CreditConfigurationDiagnostic(exception));
+            else
+                logger.LogError(exception, "Recroby Credit configuration failed for conversation {ConversationId}.", identity?.ConversationId);
             return new RgfAiResponse
             {
                 Success = false, ErrorCode = "AiCredit.InvalidConfiguration",
@@ -345,6 +369,27 @@ public sealed class RgfRecrobyService(IWorkflowClient workflows, IWorkflowRunIns
         }
         return choices;
     }
+
+    private static bool IsOnlyCreditConfigurationFailure(Exception exception) =>
+        IsOnlyFailure(exception, current => current is AiCreditConfigurationException);
+
+    private static bool IsOnlyFailure(Exception exception, Func<Exception, bool> classify)
+    {
+        // Technical causes and secondary hook/disposal failures must retain full diagnostics.
+        if (exception.Data.Values.OfType<Exception>().Any()) return false;
+        if (exception is AggregateException aggregate)
+            return aggregate.InnerExceptions.Count > 0 && aggregate.InnerExceptions.All(inner => IsOnlyFailure(inner, classify));
+        if (exception is WorkflowException or System.Reflection.TargetInvocationException && exception.InnerException is { } inner)
+            return IsOnlyFailure(inner, classify);
+        return exception.InnerException is null && classify(exception);
+    }
+
+    private static string CreditConfigurationDiagnostic(Exception exception) => exception switch
+    {
+        AggregateException aggregate => string.Join("; ", aggregate.InnerExceptions.Select(CreditConfigurationDiagnostic)),
+        { InnerException: { } inner } => CreditConfigurationDiagnostic(inner),
+        _ => exception.Message
+    };
 
     private static bool HasCreditConfigurationFailure(Exception exception)
     {

@@ -394,7 +394,81 @@ public sealed partial class RecrobyTests
         Assert.Equal(2, fixture.Credit.Users.Count);
         Assert.Equal("owner", Assert.Single(fixture.Credit.Usages).UserId);
         var conversation = fixture.GuardContexts[0].ConversationId!;
+        AssertCreditLogs(fixture, reason, response.ConversationId);
         Assert.DoesNotContain(fixture.History.Read(conversation), message => message.Role == ConversationHistoryRole.Assistant);
+    }
+
+    [Theory]
+    [InlineData(AiCreditDenialReason.UserDisabled)]
+    [InlineData(AiCreditDenialReason.InsufficientCredit)]
+    [InlineData(AiCreditDenialReason.BalanceExpired)]
+    public async Task ExpectedCreditDenialOnlyLogsInformationAtDefaultLevels(AiCreditDenialReason reason)
+    {
+        await using var fixture = new Fixture(minimumLogLevel: LogLevel.Information);
+        fixture.Credit.Decisions.Enqueue(reason);
+        var response = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "Hello" }, Token);
+        Assert.Equal($"AiCredit.{reason}", response.ErrorCode);
+        AssertCreditLogs(fixture, reason, response.ConversationId, runtimeDebug: false);
+        Assert.All(fixture.Logger.Entries.Concat(fixture.RuntimeLogger.Entries), entry =>
+        {
+            Assert.Equal(LogLevel.Information, entry.Level);
+            Assert.Null(entry.Exception);
+        });
+        Assert.Empty(fixture.DefaultChat.Invocations);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UnknownCreditCodesAndThrownInfrastructureFailuresKeepErrorDiagnostics(bool unknownCode)
+    {
+        await using var fixture = new Fixture();
+        Exception failure = unknownCode
+            ? new AIProviderRequestRejectedException("untrusted message", "AiCredit.FutureReason")
+            : new InvalidOperationException("credit infrastructure failure");
+        fixture.Credit.OnCheck = _ => throw failure;
+        var response = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "Hello" }, Token);
+        Assert.False(response.Success);
+        Assert.Null(response.ErrorCode);
+        Assert.Equal("The AI workflow could not complete the request.", response.Message);
+        var error = Assert.Single(fixture.Logger.Entries, entry => entry.Level == LogLevel.Error);
+        Assert.NotNull(error.Exception);
+        Assert.Contains(failure.Message, error.Exception.ToString());
+        var runtime = Assert.Single(fixture.RuntimeLogger.Entries, entry =>
+            entry.State.GetValueOrDefault("{OriginalFormat}") is string template &&
+            template.StartsWith("Workflow run ") && template.Contains("failed"));
+        Assert.Equal(unknownCode ? LogLevel.Debug : LogLevel.Error, runtime.Level);
+        if (unknownCode) Assert.Null(runtime.Exception);
+        else Assert.Same(runtime.Exception, error.Exception!.InnerException);
+        Assert.Empty(fixture.DefaultChat.Invocations);
+    }
+
+    private static void AssertCreditLogs(Fixture fixture, AiCreditDenialReason reason, string conversationId,
+        bool runtimeDebug = true)
+    {
+        var expected = reason switch
+        {
+            AiCreditDenialReason.UserDisabled or AiCreditDenialReason.InsufficientCredit or AiCreditDenialReason.BalanceExpired
+                => LogLevel.Information,
+            AiCreditDenialReason.InfrastructureFailure => LogLevel.Error,
+            _ => LogLevel.Warning
+        };
+        var denial = Assert.Single(fixture.Logger.Entries, entry => entry.State.ContainsKey("ReasonCode"));
+        Assert.Equal(expected, denial.Level);
+        Assert.Null(denial.Exception);
+        Assert.Equal($"AiCredit.{reason}", denial.State["ReasonCode"]);
+        Assert.Equal(string.IsNullOrEmpty(conversationId) ? null : conversationId, denial.State["ConversationId"]);
+        var failures = fixture.RuntimeLogger.Entries.Where(entry =>
+            entry.State.GetValueOrDefault("{OriginalFormat}") is string template &&
+            template.StartsWith("Workflow run ") && template.Contains("failed")).ToArray();
+        if (runtimeDebug)
+        {
+            var runtime = Assert.Single(failures);
+            Assert.Equal(LogLevel.Debug, runtime.Level);
+            Assert.Null(runtime.Exception);
+        }
+        else Assert.Empty(failures);
+        Assert.DoesNotContain(fixture.RuntimeLogger.Entries, entry => entry.Level >= LogLevel.Warning);
     }
 
     [Theory]
@@ -429,6 +503,7 @@ public sealed partial class RecrobyTests
         Assert.Equal(first.ConversationToken, denied.ConversationToken);
         Assert.Equal(first.WorkflowRunId, denied.WorkflowRunId);
         Assert.Null(denied.WorkflowStatus);
+        AssertCreditLogs(fixture, AiCreditDenialReason.InsufficientCredit, first.ConversationId);
         Assert.Equal("owner", Assert.Single(fixture.Credit.Users));
         Assert.Empty(fixture.DefaultChat.Invocations);
     }
@@ -595,6 +670,103 @@ public sealed partial class RecrobyTests
             Assert.Equal("accounting failure", Assert.IsType<InvalidOperationException>(exception.Data["Recrovit.AI.ProviderUsageHandlerFailure"]).Message);
         Assert.Single(fixture.Credit.Usages);
         Assert.Single(fixture.UsageContexts);
+    }
+
+    [Theory]
+    [InlineData("direct", false)]
+    [InlineData("reflection", false)]
+    [InlineData("workflow", false)]
+    [InlineData("aggregate", false)]
+    [InlineData("mixed-first", true)]
+    [InlineData("mixed-last", true)]
+    [InlineData("technical-wrapper", true)]
+    [InlineData("secondary", true)]
+    [InlineData("direct", false, 401)]
+    [InlineData("reflection", false, 401)]
+    [InlineData("workflow", false, 401)]
+    [InlineData("aggregate", false, 401)]
+    [InlineData("mixed-first", true, 401)]
+    [InlineData("mixed-last", true, 401)]
+    [InlineData("technical-wrapper", true, 401)]
+    [InlineData("secondary", true, 401)]
+    [InlineData("direct", true, 403)]
+    [InlineData("direct", true, 429)]
+    [InlineData("direct", true, 500)]
+    public async Task CreditConfigurationLoggingPreservesDiagnosticsAndFailureContracts(string wrapping, bool technical, int providerStatus = 0)
+    {
+        await using var fixture = new Fixture();
+        const string privateDetail = "sk-private-key-fragment";
+        using var nativeHttp = new HttpClient(new ProviderFailureHandler(providerStatus, privateDetail));
+        var nativeChat = new OpenAI.Chat.ChatClient("test-model", new System.ClientModel.ApiKeyCredential("unused-test-key"),
+            new OpenAI.OpenAIClientOptions
+            {
+                Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(nativeHttp),
+                RetryPolicy = new System.ClientModel.Primitives.ClientRetryPolicy(0)
+            });
+        Exception configuration = providerStatus == 0
+            ? new Recrovit.RecroGridFramework.AI.AiCreditConfigurationException(
+                "AI Credit model price was not found for provider 'p' and model 'default'.")
+            : await Assert.ThrowsAsync<System.ClientModel.ClientResultException>(() =>
+                nativeChat.CompleteChatAsync([new OpenAI.Chat.UserChatMessage("hello")]));
+        if (wrapping == "secondary")
+            configuration.Data["Recrovit.AI.ProviderStreamDisposalFailure"] = new InvalidOperationException("technical");
+        var failure = wrapping switch
+        {
+            "reflection" => new System.Reflection.TargetInvocationException(configuration),
+            "workflow" => new WorkflowException(WorkflowErrorCode.ExecutionFailure, "wrapped", configuration),
+            "aggregate" => new AggregateException(configuration, new System.Reflection.TargetInvocationException(configuration)),
+            "mixed-first" => new AggregateException(configuration, new InvalidOperationException("technical")),
+            "mixed-last" => new AggregateException(new InvalidOperationException("technical"), configuration),
+            "technical-wrapper" => new InvalidOperationException("technical", configuration),
+            _ => (Exception)configuration
+        };
+        if (providerStatus == 0) fixture.Credit.OnUsage = _ => throw failure;
+        else fixture.DefaultChat.ResponseFailure = failure;
+        var response = await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "hello" }, Token);
+        Assert.False(response.Success);
+        Assert.Equal(providerStatus == 0 ? "AiCredit.InvalidConfiguration"
+            : technical ? null : RgfAiErrorCodes.AiProviderAuthenticationFailed, response.ErrorCode);
+        Assert.Equal("Failed", response.WorkflowStatus);
+        Assert.DoesNotContain("provider 'p'", response.Message);
+        Assert.DoesNotContain(privateDetail, System.Text.Json.JsonSerializer.Serialize(response));
+        if (providerStatus != 0)
+            Assert.Equal(technical ? "The AI workflow could not complete the request."
+                : "Recroby could not complete the request due to a configuration error. Please contact your system administrator.", response.Message);
+        Assert.Equal(1, response.CreditUsage!.LlmCallCount);
+        if (providerStatus == 0) Assert.Null(response.CreditUsage.ChargedCredit);
+        if (providerStatus == 0) Assert.Single(fixture.Credit.Usages);
+        else Assert.Empty(fixture.Credit.Usages);
+        Assert.Single(fixture.UsageContexts);
+        var facade = Assert.Single(fixture.Logger.Entries, entry =>
+            entry.State.GetValueOrDefault("{OriginalFormat}") is string template && template.StartsWith(providerStatus == 0
+                ? "Recroby Credit configuration failed" : technical ? "Recroby workflow execution failed" : "Recroby provider authentication failed"));
+        Assert.Equal(technical ? LogLevel.Error : LogLevel.Warning, facade.Level);
+        if (technical)
+        {
+            Assert.NotNull(facade.Exception);
+            Assert.Contains(fixture.RuntimeLogger.Entries, entry => entry.Level == LogLevel.Error && entry.Exception is not null);
+        }
+        else
+        {
+            Assert.Null(facade.Exception);
+            if (providerStatus == 0)
+                Assert.Equal(configuration.Message, facade.State["Diagnostic"]?.ToString()?.Split("; ")[0]);
+            else
+                foreach (var entry in fixture.RuntimeLogger.Entries.Append(facade))
+                {
+                    Assert.Null(entry.Exception);
+                    Assert.DoesNotContain(privateDetail, string.Join(" ", entry.State.Values));
+                }
+            Assert.DoesNotContain(fixture.RuntimeLogger.Entries, entry => entry.Level >= LogLevel.Warning);
+            if (providerStatus == 0)
+                Assert.Contains(fixture.RuntimeLogger.Entries, entry => entry.Level == LogLevel.Debug && entry.Exception is null
+                    && entry.State.ContainsKey("HandlerType"));
+            Assert.Contains(fixture.RuntimeLogger.Entries, entry => entry.Level == LogLevel.Debug && entry.Exception is null
+                && entry.State.ContainsKey("WorkflowRunId") && !entry.State.ContainsKey("Diagnostic"));
+        }
+        fixture.Credit.OnUsage = null;
+        fixture.DefaultChat.ResponseFailure = null;
+        Assert.True((await fixture.Service.ExecuteAsync("owner", new() { CurrentUserMessage = "retry" }, Token)).Success);
     }
 
     [Fact]
@@ -1194,15 +1366,17 @@ public sealed partial class RecrobyTests
         public IWorkflowClient Workflows => provider.GetRequiredService<IWorkflowClient>();
         public int ToolInvocations { get; private set; }
         public RecordingRecrobyLogger Logger { get; } = new();
+        public RecordingRecrobyLogger RuntimeLogger { get; } = new();
         public Fixture(bool custom = false, bool aiAfterResume = false, bool multiple = false, bool ambiguous = false, bool reasoning = false,
             bool toolCalling = false, bool registerCredit = true, ContinuationResponseMode? responseMode = null, bool structured = false,
             IReadOnlyList<ContinuationResponseChoice>? choices = null,
-            Recrovit.RecroGridFramework.Metadata.IRgfEntityMetadataReader? metadataReader = null)
+            Recrovit.RecroGridFramework.Metadata.IRgfEntityMetadataReader? metadataReader = null,
+            LogLevel minimumLogLevel = LogLevel.Debug)
         {
             Decision.AiAfterResume = aiAfterResume;
             Decision.Structured = structured;
             var services = new ServiceCollection();
-            services.AddLogging();
+            services.AddLogging(builder => builder.SetMinimumLevel(minimumLogLevel).AddProvider(RuntimeLogger));
             if (metadataReader is not null)
             {
                 services.AddSingleton(metadataReader);
@@ -1300,6 +1474,7 @@ public sealed partial class RecrobyTests
             CachedInputTokenCount = 4, ReasoningTokenCount = 5
         };
         public Exception? StreamFailure { get; set; }
+        public Exception? ResponseFailure { get; set; }
         public Func<Task>? OnStreamStart { get; set; }
         private int streamingCalls;
         public int StreamingCalls => streamingCalls;
@@ -1313,6 +1488,7 @@ public sealed partial class RecrobyTests
         public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (ResponseFailure is not null) throw ResponseFailure;
             Messages.Add(messages.ToArray());
             Reasoning.Add(AIReasoningChatOptions.Get(options));
             if (options?.Instructions?.Contains("Answer application Entity structure questions", StringComparison.Ordinal) == true
@@ -1356,9 +1532,21 @@ public sealed partial class RecrobyTests
         }
     }
 
-    private sealed class RecordingRecrobyLogger : ILogger<RgfRecrobyService>
+    private sealed class ProviderFailureHandler(int status, string detail) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(new HttpResponseMessage((System.Net.HttpStatusCode)status)
+            {
+                Content = new StringContent(System.Text.Json.JsonSerializer.Serialize(new { error = new { message = detail } }),
+                    System.Text.Encoding.UTF8, "application/json")
+            });
+    }
+
+    private sealed class RecordingRecrobyLogger : ILogger<RgfRecrobyService>, ILoggerProvider
     {
         public List<(LogLevel Level, Exception? Exception, Dictionary<string, object?> State)> Entries { get; } = [];
+        public ILogger CreateLogger(string categoryName) => this;
+        public void Dispose() { }
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
         public bool IsEnabled(LogLevel logLevel) => true;
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
