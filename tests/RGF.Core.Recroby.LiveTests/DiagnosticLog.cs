@@ -8,6 +8,9 @@ namespace RGF.Core.Recroby.LiveTests;
 internal static class DiagnosticLog
 {
     internal static async Task<string> ResolveFilePathAsync(string webApiDirectory)
+        => Path.Combine(await ResolveTargetDirectoryAsync(webApiDirectory), "logs", "ai", "events.jsonl");
+
+    internal static async Task<string> ResolveTargetDirectoryAsync(string webApiDirectory)
     {
         // A TargetDir lekérdezése csak projektértékelés: nem indít buildet vagy restore-t.
         var start = new ProcessStartInfo("dotnet")
@@ -16,16 +19,23 @@ internal static class DiagnosticLog
             RedirectStandardOutput = true, RedirectStandardError = true
         };
         foreach (var argument in new[] { "msbuild", "RGFDemo.WebAPI.csproj", "-nologo", "-verbosity:quiet",
-            "-property:Configuration=Debug", "-getProperty:TargetDir" }) start.ArgumentList.Add(argument);
+            "-property:Configuration=Debug", "-m:1", "-property:BuildInParallel=false", "-getProperty:TargetDir" }) start.ArgumentList.Add(argument);
         using var process = Process.Start(start) ?? throw new InvalidOperationException("Nem indítható az MSBuild projektértékelése.");
         var output = process.StandardOutput.ReadToEndAsync();
         var error = process.StandardError.ReadToEndAsync();
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        await process.WaitForExitAsync(cancellation.Token);
+        try { await process.WaitForExitAsync(cancellation.Token); }
+        catch
+        {
+            if (!process.HasExited) process.Kill(entireProcessTree: true);
+            using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await process.WaitForExitAsync(stop.Token);
+            throw;
+        }
         var directory = (await output).Trim();
         if (process.ExitCode != 0 || !Path.IsPathFullyQualified(directory) || !Directory.Exists(directory))
             throw new InvalidOperationException($"Nem oldható fel a WebAPI Debug TargetDir könyvtára: {await error}. Előbb fordítsd le a Demót.");
-        return Path.Combine(directory, "logs", "ai", "events.jsonl");
+        return directory;
     }
 
     internal static long CapturePosition(string path) => File.Exists(path) ? new FileInfo(path).Length : 0;

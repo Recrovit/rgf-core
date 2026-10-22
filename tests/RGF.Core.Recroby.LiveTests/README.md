@@ -1,6 +1,6 @@
-# RGF.Core.Recroby.LiveTests – valós LLM-integrációs tesztek
+﻿# RGF.Core.Recroby.LiveTests – valós LLM-integrációs tesztek
 
-A Core repóhoz tartozó tesztprojekt azt ellenőrzi, hogy a Recroby a tényleges RGFDemo alkalmazásban, valódi felhasználói bejelentkezéssel, adatbázissal és LLM-szolgáltatóval megfelelően működik-e. A már futó WebAPI-t hívja; nem helyettesíti a modellt vagy a jogosultságkezelést tesztváltozattal.
+A Core repóhoz tartozó tesztprojekt azt ellenőrzi, hogy a Recroby a tényleges RGFDemo alkalmazásban, valódi felhasználói bejelentkezéssel, adatbázissal és LLM-szolgáltatóval megfelelően működik-e. A WebAPI-t automatikusan Debug módban fordítja, Development környezetben indítja, majd leállítja; nem helyettesíti a modellt vagy a jogosultságkezelést tesztváltozattal.
 
 A projekt kétféleképpen használható:
 
@@ -24,14 +24,14 @@ A Customer-esetek a demóban használt `RgCustomer` Entity-re és a `CustomerId`
 
 - .NET 10 SDK és az aktuális forráskód a kapcsolódó helyi RGF-projektekkel.
 - **Debug** konfiguráció: ebben érvényesülnek a helyi projekthivatkozások.
-- A WebAPI **Development** környezetben fusson. Ez a Debug konfigurációtól külön beállítás.
-- Élő futtatáshoz elérhető adatbázis, futó Duende szerver és HTTPS-en elérhető RGFDemo.WebAPI szükséges.
+- Megbízható helyi HTTPS fejlesztői tanúsítvány. A host automatikusan **Development** környezetet állít be a gyermekprocesszben.
+- Élő futtatáshoz elérhető adatbázis és külön futó Duende szerver szükséges. A WebAPI ne fusson; a konfigurált HTTPS-portnak (alapértelmezetten 11913) szabadnak kell lennie.
 - A lokális Duende környezetben működő `Admin` / `rgfdemo` demóbelépés, a tesztelt Entity-khez megfelelő jogosultságokkal és az LLM-hívásokhoz szükséges Credit-hozzáféréssel.
 - A WebAPI-ban beállított modell támogassa a natív tool callingot és a strukturált végső választ.
 
-A tesztek nem indítják el és nem állítják le az adatbázist, a Duende szervert vagy a WebAPI-t. A BlazorApp felületét nem kell elindítani, de a benne beállított OIDC-kliensnek és visszahívási címnek érvényesnek kell lennie a Duende szerveren.
+A tesztek nem indítják el és nem állítják le az adatbázist vagy a Duende szervert. Kizárólag a saját WebAPI-processzüket kezelik. A BlazorApp felületét nem kell elindítani, de a benne beállított OIDC-kliensnek és visszahívási címnek érvényesnek kell lennie a Duende szerveren.
 
-A projekt xUnit v3-at és Microsoft.Testing.Platformot használ. A tesztprojekt parancsait az **rgf-core repository gyökérkönyvtárából** futtasd. A WebAPI fordítása és indítása külön, az **rgf-demo gyökeréből** történik.
+A projekt xUnit v3-at és Microsoft.Testing.Platformot használ. A tesztprojekt parancsait az **rgf-core repository gyökérkönyvtárából** futtasd. A WebAPI automatikus fordítása és indítása a Demo projektkönyvtárában történik.
 
 ## 1. Fordítás
 
@@ -41,7 +41,7 @@ A Core gyökeréből fordítsd le a tesztprojektet és a hivatkozott Core kompon
 dotnet build tests/RGF.Core.Recroby.LiveTests/RGF.Core.Recroby.LiveTests.csproj -c Debug -m:1
 ```
 
-A build-, restore- és tesztparancsokat egymás után futtasd, ne párhuzamosan. A már futó WebAPI zárolhatja a kimeneti DLL-eket; újrafordítás előtt ilyenkor állítsd le. A további tesztparancsok a már elkészült buildet használják a `--no-build` kapcsolóval.
+A build-, restore- és tesztparancsokat egymás után futtasd, ne párhuzamosan. A már futó WebAPI zárolhatja a kimeneti DLL-eket; újrafordítás előtt ilyenkor állítsd le. A `--no-build` kapcsolós példák a már elkészült tesztprojekt-buildet használják. A teljes élő futáshoz az alábbi egyetlen Debug tesztparancs elegendő, külön előzetes build nélkül.
 
 ## 2. Futtatás élő szolgáltatások nélkül
 
@@ -52,24 +52,17 @@ Remove-Item Env:RGF_DEMO_LIVE_LLM -ErrorAction SilentlyContinue
 dotnet test --project tests/RGF.Core.Recroby.LiveTests/RGF.Core.Recroby.LiveTests.csproj -c Debug --no-build
 ```
 
-Ekkor nem történik bejelentkezés vagy LLM-hívás. Az élő tesztek `Skipped` állapotúak lesznek; ez nem jelenti azt, hogy az élő integráció sikeres.
+Ekkor a fixture nem tölt be Demo-konfigurációt, nem fordít vagy indít WebAPI-t, és nem történik bejelentkezés vagy LLM-hívás. A determinisztikus hosttesztek kizárólag saját, helyettesítő helyi processzeket használnak. Az élő tesztek `Skipped` állapotúak lesznek; ez nem jelenti azt, hogy az élő integráció sikeres.
 
-## 3. A WebAPI indítása élő teszteléshez
+## 3. Az élő környezet előkészítése
 
-Indítsd el az adatbázist és a Duende szervert. Egy külön terminálban, az **rgf-demo gyökeréből**, először fordítsd le, majd indítsd el a WebAPI-t. A tesztprojekt fordítása nem fordítja le a Demo WebAPI-t:
+Indítsd el az adatbázist és a Duende szervert. A WebAPI-t és a BlazorAppot nem kell elindítani. A WebAPI foglalt portja esetén a teszt egyértelmű hibával leáll: másik példányhoz nem csatlakozik és azt nem állítja le.
 
-```powershell
-dotnet build src/RGFDemo.WebAPI/RGFDemo.WebAPI.csproj -c Debug -m:1
+Az alábbi egyetlen Debug tesztparancs elvégzi a WebAPI buildjét (`-m:1`, helyi projekthivatkozásokkal), a tényleges Debug TargetDir feloldását, majd a lefordított DLL indítását `dotnet <DLL>` paranccsal. Nincs külön `dotnet run` buildlépés. A build időkorlátja öt perc, a készenlété két perc.
 
-$env:ASPNETCORE_ENVIRONMENT = 'Development'
-$env:Recrovit__AI__Diagnostics__Normalized__Enabled = 'true'
-$env:Recrovit__AI__Diagnostics__Normalized__IncludeContent = 'true'
-$env:Recrovit__AI__Diagnostics__StructuredOutput__IncludeContent = 'true'
-$env:Recrovit__AI__Diagnostics__RawHttp__Enabled = 'false'
-dotnet run --project src/RGFDemo.WebAPI/RGFDemo.WebAPI.csproj -c Debug --no-build --launch-profile https
-```
+A hét élő eset egyetlen collection fixture-t és WebAPI-processzt használ. A fixture előbb ellenőrzi a külön futó Duende discovery végpontot. A WebAPI HTTPS-készenlétét a `/api/rgf/capabilities` sikeres válasza, a `recrobyEnabled=true`, a saját futásazonosító és az effektív Duende-provider igazolja. Ezután történik a bejelentkezés és a védett provider-/modellkatalógus összevetése az alkalmazás konfigurációjával. A katalógus felhasználói hitelesítést igényel, ezért bejelentkezés előtt nem kérdezhető le.
 
-Visual Studióból is indíthatod a meglévő HTTPS profillal. Ugyanúgy Debug konfigurációt, Development környezetet és a fenti, explicit diagnosztikai beállításokat használj. A normál HTTPS profil nem kapcsolja be a tartalomrögzítést. A változók módosítása után indítsd újra az alkalmazást.
+Normál befejezés, teszthiba és sikertelen inicializálás után is leáll a saját WebAPI. A host a standard bemeneten kér szabályos leállást, tíz másodpercig vár, majd szükség esetén kizárólag a saját processzfáját állítja le, további tíz másodperces kilépési korláttal. A standard kimenet és hibakimenet aszinkron olvasott; indítási hibánál csak szűrt kivételtípusok és buildhibakódok jelennek meg. Titkokat tartalmazó tetszőleges alkalmazásüzenet nem kerül át a tesztkimenetbe.
 
 HTTPS-tanúsítványhiba esetén ellenőrizd a fejlesztői tanúsítvány megbízhatóságát:
 
@@ -94,7 +87,7 @@ Az élő tesztek indításához csak az explicit engedélyezést kell beállíta
 $env:RGF_DEMO_LIVE_LLM = '1'
 
 try {
-    dotnet test --project tests/RGF.Core.Recroby.LiveTests/RGF.Core.Recroby.LiveTests.csproj -c Debug --no-build
+    dotnet test --project tests/RGF.Core.Recroby.LiveTests/RGF.Core.Recroby.LiveTests.csproj -c Debug
 }
 finally {
     Remove-Item Env:RGF_DEMO_LIVE_LLM -ErrorAction SilentlyContinue
@@ -147,8 +140,10 @@ A tesztek tulajdonosa a Core, az élő host továbbra is az RGFDemo: saját adat
 
 A tesztprojekt a meglévő alkalmazásbeállításokat használja:
 
-- **WebAPI:** `appsettings.json`, `appsettings.Development.json`, környezeti változók, majd a `JwtBearerOptions:Provider` által kiválasztott tároló betöltése a `builder.Configuration.AddUserSecrets(provider, reloadOnChange: true)` hívásnak megfelelően. Innen származik az AI-provider és az alapértelmezett modell; ez a User Secrets-betöltés Duende esetén is érvényes.
-- **BlazorApp:** a saját konfigurációbetöltési sorrendje és User Secrets-szabályai. Innen származik az OIDC authority, a kliensazonosító és klienshitelesítés, a callback, a downstream API címe és a szükséges scope-ok. A callback teljes HTTPS-címét a meglévő launch profile vagy az IIS Express SSL-portja adja.
+- **WebAPI:** `appsettings.json`, `appsettings.Development.json`, környezeti változók, majd az explicit `Duende` tároló betöltése a `builder.Configuration.AddUserSecrets(provider, reloadOnChange: true)` hívásnak megfelelően. Innen származik az AI-provider és az alapértelmezett modell; ez a User Secrets-betöltés Duende esetén is érvényes.
+- **BlazorApp:** a saját konfigurációbetöltési sorrendje és User Secrets-szabályai, explicit `Recrovit:OpenIdConnect:Providers:Duende` kiválasztással. Duende esetén nem töltünk providernevű titoktárolót; a BlazorApp projekt `UserSecretsId` tárolója továbbra is betöltődik. Innen származik az OIDC authority, a kliensazonosító és klienshitelesítés, a callback, a downstream API címe és a szükséges scope-ok. A callback teljes HTTPS-címét a meglévő launch profile vagy az IIS Express SSL-portja adja.
+
+A JSON- és User Secrets-fájlokat a teszt nem írja át. A gyermekprocesszben mindkét környezeti érték Development, a `JwtBearerOptions__Provider` Duende. A Demo kizárólag Development és a saját `RGF_RECROBY_LIVE_HOST_ID` jelölő jelenlétében a User Secrets után rögzíti a Duende-providert és az alábbi diagnosztikai kapcsolókat. A normál alkalmazásindítás konfigurációs sorrendje változatlan. A szülőprocessz környezetét a host nem módosítja.
 
 A teszt ellenőrzi, hogy a futó WebAPI alapértelmezett provider-/modellaliasai egyeznek-e a forráskönyvtár aktuális beállításaival. Az API-kulcsot és a providerbeállításokat ne másold át a tesztprojektbe.
 
@@ -160,8 +155,9 @@ A korábbi `RGF_DEMO_API_URL`, `RGF_DEMO_ACCESS_TOKEN`, `RGF_DEMO_AI_MODEL` és 
 | --- | --- |
 | Az élő esetek kimaradnak | A tesztfolyamatban legyen `RGF_DEMO_LIVE_LLM=1`. |
 | A Duende elutasítja a bejelentkezést | Ellenőrizd, hogy a lokális Duende környezetben működik-e az `Admin` / `rgfdemo` nyilvános demóbelépés. A teszt nem olvas belépési környezeti változókat. |
-| Nem érhető el a Duende vagy a WebAPI | Indítsd el a megfelelő szolgáltatást; adatbázishiba esetén előbb az adatbázis elérését javítsd. |
-| Provider-/modellbeállítás eltérése | Ellenőrizd a WebAPI konfigurációját és User Secrets-ét, majd indítsd újra a backendet. |
+| Nem érhető el a Duende vagy a WebAPI | A Duende szervert és az adatbázist indítsd el külön. A WebAPI-t a teszt indítja; vizsgáld meg a szűrt indítási hibát és az alkalmazás helyi naplóját. |
+| LocalDB-indítási hiba már futó adatbázis mellett | Ellenőrizd a futtató Windows-felhasználót és a LocalDB-példánynév hozzárendelését. Izolált futtatási kontextus eltérő példányt láthat; a hiba önmagában nem jelenti az adatbázis leállását. A host nem indít vagy konfigurál át adatbázist. |
+| Provider-/modellbeállítás eltérése | Ellenőrizd a WebAPI konfigurációját és User Secrets-ét, majd indítsd újra a tesztet. |
 | Hiányzó diagnosztika | Ellenőrizd az effektív `Recrovit:AI:Diagnostics` értékeket, az NLog `IncludeScopes` és Trace szabályokat, valamint a helyi naplófájlt. |
 | Hiányzó Entity-/Property-nevek | Vizsgáld meg a helyi trace-t és a visszaadott üzenetet; ez valódi válaszminőségi hiba is lehet. Ne gyengítsd az ellenőrzést puszta HTTP-sikerre. |
 
@@ -184,9 +180,9 @@ A kizárólag helyben, explicit engedélyezett hibavizsgálat konfigurációja:
 }
 ```
 
-A meglévő konfigurációs forrásokat használd. A Development indításban a providerhez tartozó User Secrets a környezeti változók után töltődik be, ezért felülírhatja ezeket. Ellenőrizd az **effektív** értékeket is; azonosítót és betöltési sorrendet ne változtass. A normál alkalmazásindításban mindhárom tartalomrögzítési kapcsoló kikapcsolt. Vizsgálat után töröld a helyi felülírásokat, vagy állítsd az `Enabled` / `IncludeContent` értékeket `false`-ra, majd indítsd újra a WebAPI-t. A naplók ettől nem törlődnek; a helyi, teljes tartalmú fájlokat szükség szerint külön töröld.
+Az automatikus host a fenti értékeket kizárólag a saját Development processzében, a User Secrets után állítja be. Így a normalizált és strukturált tartalom biztosan elérhető, RAW pedig kikapcsolt marad. A konfigurációs fájlok kézi átírása nem szükséges. A normál alkalmazásindításban a fájlokban megadott kapcsolók érvényesülnek, alapértelmezetten kikapcsolt tartalomrögzítéssel. A helyi, teljes tartalmú naplók a teszt végén nem törlődnek.
 
-A napló helye mind Visual Studio, mind `dotnet run` esetén:
+A napló helye automatikus hosting, Visual Studio és `dotnet run` esetén is:
 
 ```text
 <WebAPI Debug TargetDir>\logs\ai\events.jsonl
@@ -205,3 +201,7 @@ A toolhívásokat a provider-válasz FunctionCall tartalma és a következő ké
 A smoke előbb a funkcionális választ, majd külön diagnosztikai állításokkal a normalizált modellválasztást, tokenhasználatot és chat agentet ellenőrzi. A provider aliasát a védett futó konfigurációs katalógus igazolja. Ez nem bizonyítja a fizikai HTTP-kérés modellmezőjét vagy a HTTP-attemptök számát. Ehhez külön RAW-vizsgálat szükséges; RAW nem előfeltétele az általános smoke-nak.
 
 A „Diagnosztikai hiba” a szükséges naplóesemény hiányát jelöli; a „Válaszminőségi hiba” a tényleges felhasználói válasz hiányosságát. A teljes katalógus el nem olvasása külön hibát ad. Egyik sem javítható a teljességi ellenőrzések gyengítésével. Az `Output` / `UserMessage` contract változatlan; a felsorolási hiba továbbra is vizsgálandó. Az új infrastruktúra futási eredményeit a [külön ellenőrzési jelentés](diagnostics-verification.md) tartalmazza; a [korábbi jelentés](verification.md) történeti bizonyíték marad.
+
+## Ismert válaszminőségi hibák
+
+A korábbi futások három Entity-/Property-felsorolási hibája továbbra is ismert. Az életciklus-kezelés nem módosítja a Recroby működését, a teljességi állításokat vagy a korábbi jelentéseket. Az automatikus build/indítás/leállítás sikerét külön kell értékelni a nem determinisztikus LLM-válaszoktól. Az új ellenőrzés eredményeit az [életciklus-ellenőrzés](lifecycle-verification-2026-10-22.md) tartalmazza.

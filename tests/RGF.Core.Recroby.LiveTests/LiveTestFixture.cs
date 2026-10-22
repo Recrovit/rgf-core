@@ -1,4 +1,4 @@
-using System.Net.Http.Headers;
+﻿using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Recrovit.RecroGridFramework.Abstraction.Contracts.AI;
@@ -15,13 +15,14 @@ public sealed class LiveTestCollection : ICollectionFixture<LiveTestFixture>
 
 public sealed class LiveTestFixture : IAsyncLifetime
 {
-    // These public demo credentials are intended only for the local Duende test environment.
+    // A nyilvános demóbelépés kizárólag a helyi Duende tesztkörnyezethez tartozik.
     private const string Username = "Admin";
     private const string Password = "rgfdemo";
     public static bool LiveEnabled => Environment.GetEnvironmentVariable("RGF_DEMO_LIVE_LLM") == "1";
     private LiveApplicationConfiguration? configuration;
     private LiveClientSettings? settings;
     private HttpClient? client;
+    private LiveWebApiHost? webApiHost;
     private UserAccessToken? token;
     private string logFilePath = "";
     internal string ExpectedModelId { get; private set; } = "";
@@ -32,25 +33,47 @@ public sealed class LiveTestFixture : IAsyncLifetime
 #if !DEBUG
         throw new InvalidOperationException("LiveTests must be built in Debug to use the local RGF implementations.");
 #endif
-        configuration = LiveApplicationConfiguration.Load();
-        settings = configuration.GetClientSettings();
-        logFilePath = await DiagnosticLog.ResolveFilePathAsync(configuration.WebApiDirectory);
-        var provider = configuration.WebApi["Recrovit:AI:DefaultProvider"];
-        if (string.IsNullOrWhiteSpace(provider)) throw new InvalidOperationException("WebAPI has no default AI provider.");
-        var providerPath = "Recrovit:AI:Providers:" + provider;
-        var model = configuration.WebApi[providerPath + ":DefaultModel"];
-        ExpectedModelId = configuration.WebApi[providerPath + ":Models:" + model]
-            ?? throw new InvalidOperationException("WebAPI default AI model alias has no model mapping.");
-        client = new HttpClient { BaseAddress = settings.ApiBaseAddress, Timeout = TimeSpan.FromMinutes(4) };
-        await AuthenticateAsync();
-        var catalog = await ReadCatalogAsync();
-        if (catalog.GetProperty("defaultProvider").GetString() != provider
-            || !catalog.GetProperty("providers").EnumerateArray().Any(item =>
-                item.GetProperty("id").GetString() == provider && item.GetProperty("defaultModel").GetString() == model))
-            throw new InvalidOperationException("The running backend provider/model defaults differ from current WebAPI configuration; restart the backend.");
-        Console.WriteLine($"Live preflight: Debug/Development configuration, user login succeeded, provider={provider}, model={ExpectedModelId}, WebAPI secrets={configuration.WebApiSecretsId ?? "none"}, " +
-            $"normalized={configuration.WebApi["Recrovit:AI:Diagnostics:Normalized:Enabled"]}, content={configuration.WebApi["Recrovit:AI:Diagnostics:Normalized:IncludeContent"]}, " +
-            $"structured={configuration.WebApi["Recrovit:AI:Diagnostics:StructuredOutput:IncludeContent"]}, raw={configuration.WebApi["Recrovit:AI:Diagnostics:RawHttp:Enabled"]}.");
+        try
+        {
+            configuration = LiveApplicationConfiguration.Load();
+            settings = configuration.GetClientSettings();
+            using (var preflight = new HttpClient { Timeout = TimeSpan.FromSeconds(15) })
+            {
+                try
+                {
+                    using var discovery = await preflight.GetAsync(new Uri(settings.Authority, "/.well-known/openid-configuration"));
+                    discovery.EnsureSuccessStatusCode();
+                }
+                catch (Exception error) when (error is HttpRequestException or TaskCanceledException)
+                {
+                    throw new InvalidOperationException("A külön indítandó Duende IDP nem érhető el megbízható HTTPS-en.");
+                }
+            }
+            webApiHost = new LiveWebApiHost();
+            await webApiHost.StartAsync(configuration.WebApiDirectory, settings.ApiBaseAddress);
+            logFilePath = webApiHost.LogFilePath;
+            var provider = configuration.WebApi["Recrovit:AI:DefaultProvider"];
+            if (string.IsNullOrWhiteSpace(provider)) throw new InvalidOperationException("WebAPI has no default AI provider.");
+            var providerPath = "Recrovit:AI:Providers:" + provider;
+            var model = configuration.WebApi[providerPath + ":DefaultModel"];
+            ExpectedModelId = configuration.WebApi[providerPath + ":Models:" + model]
+                ?? throw new InvalidOperationException("WebAPI default AI model alias has no model mapping.");
+            client = new HttpClient { BaseAddress = settings.ApiBaseAddress, Timeout = TimeSpan.FromMinutes(4) };
+            await AuthenticateAsync();
+            var catalog = await ReadCatalogAsync();
+            if (catalog.GetProperty("defaultProvider").GetString() != provider
+                || !catalog.GetProperty("providers").EnumerateArray().Any(item =>
+                    item.GetProperty("id").GetString() == provider && item.GetProperty("defaultModel").GetString() == model))
+                throw new InvalidOperationException("The running backend provider/model defaults differ from current WebAPI configuration; check the effective configuration.");
+            Console.WriteLine($"Live preflight: Debug/Development configuration, user login succeeded, provider={provider}, model={ExpectedModelId}, WebAPI secrets={configuration.WebApiSecretsId ?? "none"}, " +
+                $"normalized=true, content=true, " +
+                $"structured=true, raw=false (host override).");
+        }
+        catch
+        {
+            await DisposeAsync();
+            throw;
+        }
     }
 
     private async Task AuthenticateAsync()
@@ -73,7 +96,7 @@ public sealed class LiveTestFixture : IAsyncLifetime
         }
         catch (HttpRequestException)
         {
-            throw new InvalidOperationException("The configured WebAPI could not be reached over trusted HTTPS; start the Debug/Development backend.");
+            throw new InvalidOperationException("The owned WebAPI could not be reached over trusted HTTPS; check its startup diagnostics.");
         }
     }
 
@@ -107,12 +130,18 @@ public sealed class LiveTestFixture : IAsyncLifetime
         }
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        client?.Dispose();
-        configuration?.Dispose();
-        token = null;
-        return ValueTask.CompletedTask;
+        try { if (webApiHost is not null) await webApiHost.DisposeAsync(); }
+        finally
+        {
+            client?.Dispose();
+            configuration?.Dispose();
+            client = null;
+            configuration = null;
+            webApiHost = null;
+            token = null;
+        }
     }
 }
 

@@ -18,10 +18,10 @@ internal sealed class LiveApplicationConfiguration : IDisposable
         RepositoryRoot = root;
         WebApiDirectory = Path.Combine(root, "src", "RGFDemo.WebAPI");
         var clientDirectory = Path.Combine(root, "src", "RGFDemo.BlazorApp");
-        (WebApi, WebApiSecretsId) = LoadApplication(WebApiDirectory, "JwtBearerOptions:Provider", false);
+        (WebApi, WebApiSecretsId) = LoadApplication(WebApiDirectory, "JwtBearerOptions:Provider", false, provider: "Duende");
         try
         {
-            (Client, ClientSecretsId) = LoadApplication(clientDirectory, "Recrovit:OpenIdConnect:Provider", true);
+            (Client, ClientSecretsId) = LoadApplication(clientDirectory, "Recrovit:OpenIdConnect:Provider", true, provider: "Duende");
         }
         catch { (WebApi as IDisposable)?.Dispose(); throw; }
     }
@@ -32,7 +32,7 @@ internal sealed class LiveApplicationConfiguration : IDisposable
     internal static (IConfigurationRoot Configuration, string? SecretsId) LoadApplication(
         string directory, string providerKey, bool blazorClient,
         Action<IConfigurationBuilder>? addEnvironment = null,
-        Action<IConfigurationBuilder, string>? addSecrets = null)
+        Action<IConfigurationBuilder, string>? addSecrets = null, string? provider = null)
     {
         var builder = new ConfigurationBuilder().SetBasePath(directory)
             .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
@@ -41,8 +41,8 @@ internal sealed class LiveApplicationConfiguration : IDisposable
         addSecrets ??= (configuration, id) => configuration.AddUserSecrets(id, reloadOnChange: true);
         string? selectedId;
         using (var initial = (ConfigurationRoot)builder.Build())
-            selectedId = initial[providerKey];
-        // Match each application's secret-loading order, including the client's Duende exception.
+            selectedId = provider ?? initial[providerKey];
+        // A kliens Duende esetén csak a saját projektjéhez tartozó titkokat tölti be.
         if (!string.IsNullOrWhiteSpace(selectedId) && (!blazorClient || selectedId != "Duende"))
             addSecrets(builder, selectedId);
         else selectedId = null;
@@ -55,12 +55,14 @@ internal sealed class LiveApplicationConfiguration : IDisposable
                 : null;
             if (!string.IsNullOrWhiteSpace(assemblySecretsId)) addSecrets(builder, assemblySecretsId);
         }
+        if (provider is not null)
+            builder.AddInMemoryCollection(new Dictionary<string, string?> { [providerKey] = provider });
         return (builder.Build(), selectedId);
     }
 
     internal LiveClientSettings GetClientSettings()
     {
-        var settings = ReadClientSettings(Client, Path.Combine(RepositoryRoot, "src", "RGFDemo.BlazorApp"));
+        var settings = ReadClientSettings(Client, Path.Combine(RepositoryRoot, "src", "RGFDemo.BlazorApp"), "Duende");
         var backendProvider = Required(WebApi, "JwtBearerOptions:Provider");
         var backendAuthority = Https(Required(WebApi, $"JwtBearerOptions:{backendProvider}:Authority"), "WebAPI authority");
         if (backendAuthority.AbsoluteUri.TrimEnd('/') != settings.Authority.AbsoluteUri.TrimEnd('/'))
@@ -68,10 +70,10 @@ internal sealed class LiveApplicationConfiguration : IDisposable
         return settings;
     }
 
-    internal static LiveClientSettings ReadClientSettings(IConfiguration configuration, string clientDirectory)
+    internal static LiveClientSettings ReadClientSettings(IConfiguration configuration, string clientDirectory, string? provider = null)
     {
         const string root = "Recrovit:OpenIdConnect";
-        var provider = Required(configuration, root + ":Provider");
+        provider ??= Required(configuration, root + ":Provider");
         var providerRoot = root + ":Providers:" + provider;
         var providerApis = configuration.GetSection(providerRoot + ":DownstreamApis");
         var sharedApis = configuration.GetSection(root + ":DownstreamApis");

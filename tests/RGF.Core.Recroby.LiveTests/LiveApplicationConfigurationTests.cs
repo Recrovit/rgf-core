@@ -9,6 +9,39 @@ public sealed class LiveApplicationConfigurationTests : IDisposable
 
     public LiveApplicationConfigurationTests() => Directory.CreateDirectory(directory);
 
+    [Theory]
+    [InlineData(false, "JwtBearerOptions:Provider")]
+    [InlineData(true, "Recrovit:OpenIdConnect:Provider")]
+    public void ExplicitDuendeOverridesBaseEnvironmentAndSecretsWithoutChangingFiles(bool client, string key)
+    {
+        Write("appsettings.json", """{"JwtBearerOptions":{"Provider":"Other"},"Recrovit":{"OpenIdConnect":{"Provider":"Other"}}}""");
+        Write("RGFDemo.BlazorApp.csproj", "<Project><PropertyGroup><UserSecretsId>assembly-id</UserSecretsId></PropertyGroup></Project>");
+        Write("secrets.json", """{"JwtBearerOptions":{"Provider":"SecretProvider"},"Recrovit":{"OpenIdConnect":{"Provider":"SecretProvider"}},"Value":"secret"}""");
+        var before = Directory.GetFiles(directory).ToDictionary(path => path, File.ReadAllBytes);
+        var stores = new List<string>();
+        var loaded = LiveApplicationConfiguration.LoadApplication(directory, key, client,
+            builder => builder.AddInMemoryCollection(new Dictionary<string, string?> { [key] = "EnvironmentProvider" }),
+            (builder, id) => { stores.Add(id); builder.AddJsonFile(Path.Combine(directory, "secrets.json")); }, "Duende");
+        using var configuration = (ConfigurationRoot)loaded.Configuration;
+        Assert.Equal(client ? ["assembly-id"] : new[] { "Duende" }, stores);
+        Assert.Equal("Duende", configuration[key]);
+        Assert.Equal("secret", configuration["Value"]);
+        foreach (var (path, bytes) in before) Assert.Equal(bytes, File.ReadAllBytes(path));
+    }
+
+    [Fact]
+    public void ClientCanExplicitlyUseDuendeWhenAnotherProviderIsSelected()
+    {
+        WriteLaunchSettings();
+        var values = ClientValues();
+        values["Recrovit:OpenIdConnect:Provider"] = "Other";
+        using var configuration = (ConfigurationRoot)new ConfigurationBuilder().AddInMemoryCollection(values).Build();
+        var settings = LiveApplicationConfiguration.ReadClientSettings(configuration, directory, "Duende");
+        Assert.Equal("Duende", settings.Provider);
+        Assert.Equal("configured-client", settings.ClientId);
+        Assert.Equal("test-only-client-secret", settings.ClientSecret);
+    }
+
     [Fact]
     public void WebApiLoadsSelectedProviderSecretsAfterJsonAndEnvironment()
     {
