@@ -8,7 +8,7 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <Version>10.3.0</Version>
+    <Version>10.4.0</Version>
     <FileVersion>$(Version).1$([System.DateTime]::Now.ToString('MMdd'))</FileVersion>
     <InformationalVersion>$(FileVersion)</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
@@ -19,7 +19,7 @@
   </ItemGroup>
 
   <ItemGroup Condition="!Exists('$(LocalRgfLegacy)')">
-    <PackageReference Include="RecroGrid" Version="10.3.0"/>
+    <PackageReference Include="RecroGrid" Version="10.4.0" />
   </ItemGroup>
 
   <ItemGroup>

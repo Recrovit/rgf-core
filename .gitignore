@@ -427,7 +427,11 @@ FodyWeavers.xsd
 *.msm
 *.msp
 
+/rgf-docs/
 **/appsettings.*.json
 src/Directory.Build.targets
-.github/copilot-instructions.md
 
+/.agents/rgf-docs/guidelines.md
+/.codex/config.toml
+/.codex/rules/default.rules
+**/AGENTS.md*

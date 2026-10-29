@@ -7,6 +7,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
   <!-- Custom Properties -->
   <PropertyGroup>
     <RepositoryRoot>$(MSBuildThisFileDirectory)</RepositoryRoot>
@@ -38,6 +43,7 @@
 
   <ItemGroup Condition="Exists('$(RepositoryRoot)README.md')">
     <None Include="$(RepositoryRoot)README.md" Pack="true" PackagePath="" />
+    <None Include="$(RepositoryRoot)CHANGELOG.md" Pack="false" />
   </ItemGroup>
 
 </Project>

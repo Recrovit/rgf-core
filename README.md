@@ -15,3 +15,19 @@
 [![NuGet Version](https://img.shields.io/nuget/v/Recrovit.RecroGridFramework.Client.Blazor.SessionAuth.svg?label=Recrovit.RecroGridFramework.Client.Blazor.SessionAuth)](https://www.nuget.org/packages/Recrovit.RecroGridFramework.Client.Blazor.SessionAuth/)
 
 Official Website: [RecroGrid Framework](https://RecroGridFramework.com)
+
+## Initialization
+
+```csharp
+using Recrovit.RecroGridFramework.Extensions;
+
+builder.AddRGF();
+```
+
+Core initializes general RGF services and capabilities without AI dependencies. For Recroby, install `Recrovit.RecroGridFramework.AI.Recroby` and call `AddRGFWithRecroby()` from `Recrovit.RecroGridFramework.AI.Recroby.Extensions`. Core-only hosts report `recrobyEnabled: false`.
+
+## Developer documentation
+
+- [Core initialization](https://github.com/Recrovit/rgf-docs/blob/dev/content/rgf-core/docs/core-initialization.md)
+- [Recroby architecture and integration](https://github.com/Recrovit/rgf-docs/blob/dev/content/rgf-recroby/docs/architecture/recroby.md)
+- [AI Credit integration](https://github.com/Recrovit/rgf-docs/blob/dev/content/rgf-recroby/docs/ai-credit-integration.md)
