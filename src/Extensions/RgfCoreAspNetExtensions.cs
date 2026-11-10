@@ -37,7 +37,7 @@ public static class RgfCoreAspNetExtensions
         {
             if (services.Any(descriptor => descriptor.ServiceType == typeof(CoreFeature))) return;
             services.AddSingleton(this);
-            services.TryAddSingleton(new RgfCapabilitiesResponse(false));
+            services.TryAddSingleton(new RgfCapabilitiesResponse(false) { AllowFilterToLower = RecroGrid.AllowFilterToLower });
             services.AddControllers().AddApplicationPart(typeof(RgfCapabilitiesController).Assembly);
         }
     }
