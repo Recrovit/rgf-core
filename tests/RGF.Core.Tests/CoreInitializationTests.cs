@@ -6,12 +6,95 @@ using Recrovit.RecroGridFramework.Abstraction.Contracts.AI;
 using Recrovit.RecroGridFramework.Core.Http;
 using Recrovit.RecroGridFramework.Extensions;
 using System.Text.Json;
+using System.Reflection;
+using Recrovit.RecroGridFramework.Security;
 using Xunit;
 
 namespace RGF.Core.Tests;
 
-public sealed class CoreInitializationTests
+[CollectionDefinition("Core initialization", DisableParallelization = true)]
+public sealed class CoreInitializationCollection { }
+
+[Collection("Core initialization")]
+public sealed class CoreInitializationTests : IDisposable
 {
+    private readonly Dictionary<FieldInfo, object?> state = typeof(RecroSec)
+        .GetFields(BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public)
+        .Where(field => !field.IsInitOnly && !field.IsLiteral)
+        .ToDictionary(field => field, field => field.GetValue(null));
+
+    public CoreInitializationTests()
+    {
+        // Minden teszt egy új folyamat kezdeti állapotát modellezi.
+        typeof(RecroSec).GetField("_singleUserMode", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, null);
+        typeof(RecroSec).GetField("_allowSingleUserModeFromConfiguration", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, true);
+    }
+
+    public static IEnumerable<object?[]> SingleUserCases()
+    {
+        foreach (var webHost in new[] { false, true })
+        {
+            foreach (var allow in new bool?[] { null, false, true })
+            {
+                foreach (var configured in new bool?[] { null, false, true })
+                {
+                    yield return [webHost, allow, configured];
+                }
+            }
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(SingleUserCases))]
+    public async Task SingleUserModeUsesLegacyConfiguration(bool webHost, bool? allow, bool? configured)
+    {
+        var builder = WebApplication.CreateBuilder();
+        builder.Configuration.Sources.Clear();
+        builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Recrovit:RecroSec:SingleUserMode"] = configured?.ToString()
+        });
+        for (var registration = 0; registration < 2; registration++)
+        {
+            if (webHost)
+            {
+                if (allow.HasValue)
+                {
+                    builder.WebHost.AddRGF(allowSingleUserModeFromConfiguration: allow.Value);
+                }
+                else
+                {
+                    builder.WebHost.AddRGF();
+                }
+            }
+            else if (allow.HasValue)
+            {
+                builder.AddRGF(allowSingleUserModeFromConfiguration: allow.Value);
+            }
+            else
+            {
+                builder.AddRGF();
+            }
+        }
+        await using var app = builder.Build();
+#if DEBUG
+        const bool defaultAllow = true;
+#else
+        const bool defaultAllow = false;
+#endif
+        Assert.Equal((allow ?? defaultAllow) && configured == true, RecroSec.SingleUserMode);
+        Assert.Equal(RecroSec.SingleUserMode, RecroSec.IsAdmin(string.Empty));
+        Assert.Single(builder.Services, descriptor => descriptor.ServiceType == typeof(RgfCapabilitiesResponse));
+    }
+
+    public void Dispose()
+    {
+        foreach (var (field, value) in state)
+        {
+            field.SetValue(null, value);
+        }
+    }
+
     [Theory]
     [InlineData(false, false, null)]
     [InlineData(false, true, true)]

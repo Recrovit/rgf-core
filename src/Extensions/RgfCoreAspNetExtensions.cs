@@ -12,24 +12,30 @@ namespace Recrovit.RecroGridFramework.Extensions;
 /// <summary>Initializes the base RGF services and Core features together.</summary>
 public static class RgfCoreAspNetExtensions
 {
+#if DEBUG
+    internal const bool DefaultAllowSingleUserModeFromConfiguration = true;
+#else
+    internal const bool DefaultAllowSingleUserModeFromConfiguration = false;
+#endif
+
     /// <summary>Initializes base RGF and Core features using the application configuration.</summary>
     /// <param name="builder">The application builder receiving the registrations.</param>
-    /// <param name="singleUserMode">The base backend single-user setting; defaults to true.</param>
+    /// <param name="allowSingleUserModeFromConfiguration">Whether configuration may enable SingleUserMode. Defaults to false. Missing configuration always leaves the mode disabled.</param>
     /// <returns>The supplied builder.</returns>
     /// <remarks>Core features are registered once per service collection; the host owns the HTTP pipeline.</remarks>
-    public static WebApplicationBuilder AddRGF(this WebApplicationBuilder builder, bool singleUserMode = true)
+    public static WebApplicationBuilder AddRGF(this WebApplicationBuilder builder, bool allowSingleUserModeFromConfiguration = DefaultAllowSingleUserModeFromConfiguration)
     {
-        RgfBackendFeatureExtensions.AddRGF(builder, singleUserMode, new CoreFeature());
+        RgfBackendFeatureExtensions.AddRGF(builder, allowSingleUserModeFromConfiguration, new CoreFeature());
         return builder;
     }
 
     /// <summary>Schedules base RGF and Core feature initialization for the web host.</summary>
     /// <param name="builder">The web host builder receiving the service callback.</param>
-    /// <param name="singleUserMode">The base backend single-user setting; defaults to true.</param>
+    /// <param name="allowSingleUserModeFromConfiguration">Whether configuration may enable SingleUserMode. Defaults to false. Missing configuration always leaves the mode disabled.</param>
     /// <returns>The supplied builder.</returns>
     /// <remarks>Uses host configuration and the same enablement rules as the application-builder overload.</remarks>
-    public static IWebHostBuilder AddRGF(this IWebHostBuilder builder, bool singleUserMode = true)
-        => RgfBackendFeatureExtensions.AddRGF(builder, singleUserMode, new CoreFeature());
+    public static IWebHostBuilder AddRGF(this IWebHostBuilder builder, bool allowSingleUserModeFromConfiguration = DefaultAllowSingleUserModeFromConfiguration)
+        => RgfBackendFeatureExtensions.AddRGF(builder, allowSingleUserModeFromConfiguration, new CoreFeature());
 
     private sealed class CoreFeature : IRgfBackendFeature
     {
